@@ -14,7 +14,6 @@ from simplyprint_ws_client.core.settings import ClientSettings
 from simplyprint_ws_client.core.ws_protocol.connection import ConnectionMode
 from simplyprint_ws_client.shared.cli.cli import ClientCli
 from simplyprint_ws_client.shared.logging import ClientHandler
-from simplyprint_ws_client.shared.sp.url_builder import SimplyPrintBackend
 
 from . import __version__
 from .cli.autodiscover import AutoDiscover
@@ -105,11 +104,9 @@ def main():
         config_factory=VirtualConfig,
         allow_setup=True,
         config_manager_t=ConfigManagerType.JSON,
-        backend=SimplyPrintBackend.PRODUCTION,
     )
 
     ClientHandler.setup_logging(settings)
-    logging.getLogger().setLevel(logging.INFO)
     logging.getLogger("PIL").setLevel(logging.INFO)
     logging.getLogger("aiohttp.client").setLevel(logging.INFO)
 
