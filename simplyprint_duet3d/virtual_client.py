@@ -301,6 +301,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
             'M221',
             'M701',
             'M702',
+            'M290',
             'G1',
             'G28',
             'G29',
@@ -324,6 +325,8 @@ class VirtualClient(DefaultClient[VirtualConfig]):
             else:
                 response.append('{!s} G-Code blocked'.format(item.code))
                 # TODO: notify sentry
+
+        self.logger.debug(f"Gcode response: {'\n   [gcode] '.join(response)}")
 
     async def _perform_self_upgrade(self) -> None:
         """Perform self-upgrade and restart the API."""
