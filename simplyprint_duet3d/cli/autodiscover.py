@@ -79,6 +79,8 @@ async def get_webcam_url(duet: RepRapFirmware) -> str:
 
         if duet_url_parse.hostname != '':
             hostname = duet_url_parse.hostname
+            if ":" in hostname:
+                hostname = f"[{hostname}]"
         if webcam_url_parse.port is not None:
             hostname = f"{hostname}:{webcam_url_parse.port}"
         if hostname == '':
