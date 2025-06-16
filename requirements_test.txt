@@ -2,7 +2,7 @@ pytest-cov
 pytest-mock
 pytest-asyncio
 flake8
-flake8-import-order
+flake8-import-order==0.18.2
 flake8-blind-except
 flake8-builtins
 flake8-docstrings
