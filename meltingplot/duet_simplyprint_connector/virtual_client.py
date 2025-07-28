@@ -301,6 +301,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
             'M221',
             'M701',
             'M702',
+            'M290',
             'G1',
             'G28',
             'G29',
