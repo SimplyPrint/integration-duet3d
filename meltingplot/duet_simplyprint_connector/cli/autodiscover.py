@@ -84,7 +84,7 @@ async def get_webcam_url(duet: RepRapFirmware) -> str:
     schema = webcam_url_parse.scheme
     hostname = webcam_url_parse.netloc
 
-    if webcam_url_parse.hostname.lower() == 'hostname' or hostname == '':
+    if hostname == '' or (webcam_url_parse.hostname is not None and webcam_url_parse.hostname.lower() == 'hostname'):
         duet_url_parse = urllib.parse.urlparse(duet.address)
 
         if duet_url_parse.hostname != '':
