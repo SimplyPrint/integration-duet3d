@@ -64,12 +64,16 @@ def run_app(autodiscover, app, profile):
 
     networks = rescan_existing_networks(app)
 
-    for network, pwd in networks.items():
-        click.echo(f"Scanning existing network: {network} with password {pwd}")
-        if ':' in network:
-            autodiscover._autodiscover(password=pwd, ipv6_range=network, ipv4_range='127.0.0.1/32')
-        else:
-            autodiscover._autodiscover(password=pwd, ipv4_range=network, ipv6_range="::1/128")
+    try:
+        for network, pwd in networks.items():
+            click.echo(f"Scanning existing network: {network} with password {pwd}")
+            if ':' in network:
+                autodiscover._autodiscover(password=pwd, ipv6_range=network, ipv4_range='127.0.0.1/32')
+            else:
+                autodiscover._autodiscover(password=pwd, ipv4_range=network, ipv6_range="::1/128")
+    except Exception as e:
+        click.echo(f"Error during network scan: {e}")
+        logging.error(f"Error during network scan: {e}")
 
     if profile:
         import cProfile
