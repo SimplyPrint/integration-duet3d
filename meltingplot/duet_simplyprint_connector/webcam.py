@@ -83,6 +83,7 @@ class Webcam:
 
         await self.client.send(
             StreamMsg(base64jpg=base64_encoded),
+            skip_dispatch=True,
         )
 
     async def _send_snapshot_to_endpoint(self, image: bytes, request: WebcamSnapshotRequest) -> None:
