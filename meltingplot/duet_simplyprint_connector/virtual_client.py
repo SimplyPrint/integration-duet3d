@@ -424,7 +424,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         with tempfile.NamedTemporaryFile(suffix='.gcode') as f:
             async for chunk in downloader.download(
-                url=event.url,
+                data=event,
                 clamp_progress=(lambda x: float(max(0.0, min(50.0, x / 2.0)))),
             ):
                 f.write(chunk)
@@ -472,7 +472,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
     async def on_start_print(self, _) -> None:
         """Start the print job."""
         await self.duet.gcode(
-            f'M23 "0:/gcodes/{self.printer.job_info.filename}"',
+            f'M23 "0:/gcodes/{self.printer.job_info.filename.root}"',
         )
         await self.duet.gcode('M24')
 
