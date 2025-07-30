@@ -238,6 +238,8 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         await self._duet_printer_task()
         await self._connector_status_task()
+        # send first snapshot without request
+        await self._webcam.request_snapshot()
 
     async def on_remove_connection(self, _) -> None:
         """Remove the connection."""
@@ -697,6 +699,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
     async def on_webcam_test(self) -> None:
         """Test the webcam."""
+        await self._webcam.request_snapshot()
         self.printer.webcam_info.connected = (True if self.config.webcam_uri is not None else False)
 
     async def on_webcam_snapshot(
