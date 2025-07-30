@@ -92,11 +92,17 @@ class Webcam:
         self.client.logger.info(
             f'Sending webcam snapshot id: {request.snapshot_id} endpoint: {request.endpoint or "Simplyprint"}',
         )
-        await sp_api.SimplyPrintApi.post_snapshot(
-            snapshot_id=request.snapshot_id,
-            image_data=image,
-            endpoint=request.endpoint,
-        )
+        try:
+            await sp_api.SimplyPrintApi.post_snapshot(
+                snapshot_id=request.snapshot_id,
+                image_data=image,
+                endpoint=request.endpoint,
+            )
+        except Exception as e:
+            self.client.logger.error(
+                f'Failed to send webcam snapshot id: {request.snapshot_id}'
+                f' endpoint: {request.endpoint or "Simplyprint"} - {e}',
+            )
 
     async def _get_image(self) -> bytes:
         try:
@@ -198,4 +204,11 @@ class Webcam:
             except Exception:
                 self.client.logger.exception("Failed to distribute webcam image")
                 await asyncio.sleep(10)
+        if time.time() >= self._timeout:
+            # if we reach the timeout, we send a final snapshot
+            # this is a workaround for the fact that SP can get stuck if no snapshot is sent
+            # TODO: remove this when fixed in SP backend or simplyprint-ws-client
+            self.client.logger.debug('Sending final additional snapshot before stopping distribution task')
+            image = await self._get_image()
+            await self._send_snapshot(image=image)
         self._distribution_task_handle = None
