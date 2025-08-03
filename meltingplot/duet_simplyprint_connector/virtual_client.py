@@ -101,6 +101,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         self.duet.events.on('connect', self._duet_on_connect)
         self.duet.events.on('objectmodel', self._duet_on_objectmodel)
+        self.duet.events.on('state', self._duet_on_state)
 
     async def _initialize_tasks(self) -> None:
         """Initialize background tasks."""
@@ -140,6 +141,14 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         self._set_printer_name(network)
         self._set_firmware_info(board)
+
+    async def _duet_on_state(self, old_state) -> None:
+        """Handle State changes."""
+        self.logger.debug(f"Duet state changed from {old_state} to {self.duet.state}")
+
+        # send a snapshot without request to get in sync with SP
+        # TODO: remove this when it is fixed in SP
+        await self._webcam.request_snapshot()
 
     async def _set_duet_unique_id(self, board: dict) -> None:
         """Set the unique ID if it is not set and emit an event to notify the client."""
