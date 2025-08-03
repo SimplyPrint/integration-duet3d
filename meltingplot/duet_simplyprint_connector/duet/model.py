@@ -106,7 +106,7 @@ class DuetPrinter():
         old_state = DuetState(old_om['state']['status'])
         if self.state != old_state:
             self.logger.debug(f"State change: {old_state} -> {self.state}")
-            self.events.emit(DuetModelEvents.state, self.state)
+            self.events.emit(DuetModelEvents.state, old_state)
 
     async def connect(self) -> None:
         """Connect the printer."""
