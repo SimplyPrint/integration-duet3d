@@ -20,6 +20,7 @@ from . import __version__
 from .cli.autodiscover import AutoDiscover
 from .cli.install import install_as_service
 from .virtual_client import VirtualClient, VirtualConfig
+from .watchdog import Watchdog
 
 
 def rescan_existing_networks(app):
@@ -57,7 +58,7 @@ def rescan_existing_networks(app):
     return networks
 
 
-def run_app(autodiscover, app, profile):
+def run_app(autodiscover, app, profile, watchdog: Watchdog):
     """Run the application."""
     click.echo("Starting the Meltingplot Duet SimplyPrint.io Connector")
     click.echo('Perform network scans for existing networks')
@@ -96,11 +97,16 @@ def run_app(autodiscover, app, profile):
 
         atexit.register(app_exit)
 
+    watchdog._reset_sync()  # Reset the watchdog timer
+    watchdog.start()  # Start the watchdog to start the timer
     app.run_blocking()
 
 
 def main():
     """Initiate the connector as the main entry point."""
+    watchdog = Watchdog(timeout=60)
+    VirtualClient.watchdog = watchdog
+
     settings = ClientSettings(
         name="DuetConnector",
         version=__version__,
@@ -128,7 +134,7 @@ def main():
     cli.add_command(
         click.Command(
             "start",
-            callback=lambda profile: run_app(autodiscover, app, profile),
+            callback=lambda profile: run_app(autodiscover, app, profile, watchdog),
             help="Start the client",
             params=[click.Option(["--profile"], is_flag=True, help="Enable profiling")],
         ),

@@ -39,6 +39,7 @@ from .gcode import GCodeBlock
 from .network import get_local_ip_and_mac
 from .state import map_duet_state_to_printer_status
 from .task import async_supress, async_task
+from .watchdog import Watchdog
 from .webcam import Webcam
 
 
@@ -57,6 +58,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
     """A Websocket client for the SimplyPrint.io Service."""
 
     duet: DuetPrinter
+    watchdog: Watchdog
     _webcam: Webcam
 
     def __init__(self, *args, **kwargs) -> None:
@@ -686,6 +688,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
     async def tick(self, _) -> None:
         """Update the client state."""
+        await self.watchdog.reset()  # Reset the watchdog timer
         try:
             await self.send_ping()
         except Exception as e:
