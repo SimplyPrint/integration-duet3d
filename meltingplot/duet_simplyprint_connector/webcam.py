@@ -186,14 +186,13 @@ class Webcam:
 
         while not self.client._is_stopped and time.time() < self._timeout:
             try:
-                if self._snapshot_requests.qsize() > 0:
+                image = await self._get_image()
+                if image is not None and self._snapshot_requests.qsize() > 0:
                     request = await self._snapshot_requests.get()
                     if request.snapshot_id is not None:
-                        image = await self._get_image()
                         await self._send_snapshot_to_endpoint(image=image, request=request)
                         continue
                     if self.client.printer.intervals.is_ready('webcam'):
-                        image = await self._get_image()
                         await self._send_snapshot(image=image)
                     else:
                         await self._snapshot_requests.put(request)
