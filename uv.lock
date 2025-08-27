@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.9"
 resolution-markers = [
     "python_full_version >= '3.10'",
@@ -1317,7 +1317,7 @@ wheels = [
 
 [[package]]
 name = "simplyprint-duet3d"
-version = "1.3.8"
+version = "1.3.9"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -1355,7 +1355,7 @@ requires-dist = [
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37.0" },
     { name = "psutil", specifier = ">=6.1.1" },
     { name = "pyee", specifier = ">=12.1.1" },
-    { name = "simplyprint-ws-client", specifier = "==1.0.1rc3" },
+    { name = "simplyprint-ws-client", specifier = "==1.0.1rc22" },
     { name = "strenum", specifier = ">=0.4.15" },
 ]
 
@@ -1369,7 +1369,7 @@ dev = [
     { name = "flake8-commas", specifier = ">=4.0.0" },
     { name = "flake8-comprehensions", specifier = ">=3.16.0" },
     { name = "flake8-docstrings", specifier = ">=1.7.0" },
-    { name = "flake8-import-order", specifier = ">=0.18.2" },
+    { name = "flake8-import-order", specifier = "==0.18.2" },
     { name = "pep8-naming", specifier = ">=0.14.1" },
     { name = "pytest-asyncio", specifier = ">=0.25.3" },
     { name = "pytest-cov", specifier = ">=6.0.0" },
@@ -1380,7 +1380,7 @@ dev = [
 
 [[package]]
 name = "simplyprint-ws-client"
-version = "1.0.1rc3"
+version = "1.0.1rc22"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1395,8 +1395,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "yarl" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/76/50/6074db0093628b7da516493295c3e631020e1c6e010f1a28b88422b2790d/simplyprint_ws_client-1.0.1rc22.tar.gz", hash = "sha256:5bbcd134b5b4985d60f54afea0e3234d82307bf24166881978e9fc9f2bc0c6fa", size = 86510, upload-time = "2025-06-20T23:43:34.316Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/84/ca/e2fd8929f799461dc07996caf7ab9cc63905b4dc7773289b2239b5fb13c3/simplyprint_ws_client-1.0.1rc3-py3-none-any.whl", hash = "sha256:3fbe5d3cde154f6f40a3464f0ef3df050762d85ca2fe4ad73e6a5d77a41e46c0", size = 97353, upload-time = "2025-01-25T14:08:25.335Z" },
+    { url = "https://files.pythonhosted.org/packages/02/84/97cb212abd62ac50b1aa847f4ae0f0b838c6601f12917047890f33bf0603/simplyprint_ws_client-1.0.1rc22-py3-none-any.whl", hash = "sha256:f94a5460ba8befb615a91679966d0aa90c4cd01145f9129c34942d3cefeca6b2", size = 116282, upload-time = "2025-06-20T23:43:33.02Z" },
 ]
 
 [[package]]

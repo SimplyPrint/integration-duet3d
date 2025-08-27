@@ -39,6 +39,7 @@ from .gcode import GCodeBlock
 from .network import get_local_ip_and_mac
 from .state import map_duet_state_to_printer_status
 from .task import async_supress, async_task
+from .watchdog import Watchdog
 from .webcam import Webcam
 
 
@@ -57,6 +58,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
     """A Websocket client for the SimplyPrint.io Service."""
 
     duet: DuetPrinter
+    watchdog: Watchdog
     _webcam: Webcam
 
     def __init__(self, *args, **kwargs) -> None:
@@ -101,6 +103,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         self.duet.events.on('connect', self._duet_on_connect)
         self.duet.events.on('objectmodel', self._duet_on_objectmodel)
+        self.duet.events.on('state', self._duet_on_state)
 
     async def _initialize_tasks(self) -> None:
         """Initialize background tasks."""
@@ -140,6 +143,14 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         self._set_printer_name(network)
         self._set_firmware_info(board)
+
+    async def _duet_on_state(self, old_state) -> None:
+        """Handle State changes."""
+        self.logger.debug(f"Duet state changed from {old_state} to {self.duet.state}")
+
+        # send a snapshot without request to get in sync with SP
+        # TODO: remove this when it is fixed in SP
+        await self._webcam.request_snapshot()
 
     async def _set_duet_unique_id(self, board: dict) -> None:
         """Set the unique ID if it is not set and emit an event to notify the client."""
@@ -238,6 +249,8 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         await self._duet_printer_task()
         await self._connector_status_task()
+        # send first snapshot without request
+        await self._webcam.request_snapshot()
 
     async def on_remove_connection(self, _) -> None:
         """Remove the connection."""
@@ -299,6 +312,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
             'M190',
             'M220',
             'M221',
+            'M562',
             'M701',
             'M702',
             'M290',
@@ -424,7 +438,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         with tempfile.NamedTemporaryFile(suffix='.gcode') as f:
             async for chunk in downloader.download(
-                url=event.url,
+                data=event,
                 clamp_progress=(lambda x: float(max(0.0, min(50.0, x / 2.0)))),
             ):
                 f.write(chunk)
@@ -472,7 +486,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
     async def on_start_print(self, _) -> None:
         """Start the print job."""
         await self.duet.gcode(
-            f'M23 "0:/gcodes/{self.printer.job_info.filename}"',
+            f'M23 "0:/gcodes/{self.printer.job_info.filename.root}"',
         )
         await self.duet.gcode('M24')
 
@@ -675,6 +689,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
     async def tick(self, _) -> None:
         """Update the client state."""
+        await self.watchdog.reset()  # Reset the watchdog timer
         try:
             await self.send_ping()
         except Exception as e:
@@ -697,6 +712,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
     async def on_webcam_test(self) -> None:
         """Test the webcam."""
+        await self._webcam.request_snapshot()
         self.printer.webcam_info.connected = (True if self.config.webcam_uri is not None else False)
 
     async def on_webcam_snapshot(

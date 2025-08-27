@@ -53,6 +53,17 @@ async def download_dwc_file(duet: RepRapFirmware) -> dict:
     return response
 
 
+def _format_hostname_for_url(hostname: str) -> str:
+    """Format the hostname for URL reassembling."""
+    try:
+        if ipaddress.ip_address(hostname).version == 6:
+            hostname = f"[{hostname}]"
+    except ValueError:
+        # Not an IP address, keep it as is
+        pass
+    return hostname
+
+
 async def get_webcam_url(duet: RepRapFirmware) -> str:
     """Sanitize the webcam URL."""
     dwc_settings = await download_dwc_file(duet)
@@ -74,13 +85,11 @@ async def get_webcam_url(duet: RepRapFirmware) -> str:
     schema = webcam_url_parse.scheme
     hostname = webcam_url_parse.netloc
 
-    if webcam_url_parse.hostname.lower() == 'hostname' or hostname == '':
+    if hostname == '' or (webcam_url_parse.hostname is not None and webcam_url_parse.hostname.lower() == 'hostname'):
         duet_url_parse = urllib.parse.urlparse(duet.address)
 
         if duet_url_parse.hostname != '':
-            hostname = duet_url_parse.hostname
-            if ":" in hostname:
-                hostname = f"[{hostname}]"
+            hostname = _format_hostname_for_url(duet_url_parse.hostname)
         if webcam_url_parse.port is not None:
             hostname = f"{hostname}:{webcam_url_parse.port}"
         if hostname == '':

@@ -13,13 +13,14 @@ from simplyprint_ws_client.core.config import ConfigManagerType
 from simplyprint_ws_client.core.settings import ClientSettings
 from simplyprint_ws_client.core.ws_protocol.connection import ConnectionMode
 from simplyprint_ws_client.shared.cli.cli import ClientCli
-from simplyprint_ws_client.shared.logging import ClientHandler
+from simplyprint_ws_client.shared.logging import setup_logging
 from simplyprint_ws_client.shared.sp.url_builder import SimplyPrintBackend
 
 from . import __version__
 from .cli.autodiscover import AutoDiscover
 from .cli.install import install_as_service
 from .virtual_client import VirtualClient, VirtualConfig
+from .watchdog import Watchdog
 
 
 def rescan_existing_networks(app):
@@ -57,19 +58,23 @@ def rescan_existing_networks(app):
     return networks
 
 
-def run_app(autodiscover, app, profile):
+def run_app(autodiscover, app, profile, watchdog: Watchdog):
     """Run the application."""
     click.echo("Starting the Meltingplot Duet SimplyPrint.io Connector")
     click.echo('Perform network scans for existing networks')
 
     networks = rescan_existing_networks(app)
 
-    for network, pwd in networks.items():
-        click.echo(f"Scanning existing network: {network} with password {pwd}")
-        if ':' in network:
-            autodiscover._autodiscover(password=pwd, ipv6_range=network, ipv4_range='127.0.0.1/32')
-        else:
-            autodiscover._autodiscover(password=pwd, ipv4_range=network, ipv6_range="::1/128")
+    try:
+        for network, pwd in networks.items():
+            click.echo(f"Scanning existing network: {network} with password {pwd}")
+            if ':' in network:
+                autodiscover._autodiscover(password=pwd, ipv6_range=network, ipv4_range='127.0.0.1/32')
+            else:
+                autodiscover._autodiscover(password=pwd, ipv4_range=network, ipv6_range="::1/128")
+    except Exception as e:
+        click.echo(f"Error during network scan: {e}")
+        logging.error(f"Error during network scan: {e}")
 
     if profile:
         import cProfile
@@ -92,11 +97,16 @@ def run_app(autodiscover, app, profile):
 
         atexit.register(app_exit)
 
+    watchdog._reset_sync()  # Reset the watchdog timer
+    watchdog.start()  # Start the watchdog to start the timer
     app.run_blocking()
 
 
 def main():
     """Initiate the connector as the main entry point."""
+    watchdog = Watchdog(timeout=60)
+    VirtualClient.watchdog = watchdog
+
     settings = ClientSettings(
         name="DuetConnector",
         version=__version__,
@@ -106,9 +116,10 @@ def main():
         allow_setup=True,
         config_manager_t=ConfigManagerType.JSON,
         backend=SimplyPrintBackend.PRODUCTION,
+        development=False,
     )
 
-    ClientHandler.setup_logging(settings)
+    setup_logging(settings)
     logging.getLogger().setLevel(logging.INFO)
     logging.getLogger("PIL").setLevel(logging.INFO)
     logging.getLogger("aiohttp.client").setLevel(logging.INFO)
@@ -123,7 +134,7 @@ def main():
     cli.add_command(
         click.Command(
             "start",
-            callback=lambda profile: run_app(autodiscover, app, profile),
+            callback=lambda profile: run_app(autodiscover, app, profile, watchdog),
             help="Start the client",
             params=[click.Option(["--profile"], is_flag=True, help="Enable profiling")],
         ),
