@@ -2,7 +2,7 @@ import pytest
 import threading
 import time
 import asyncio
-from meltingplot.duet_simplyprint_connector.watchdog import Watchdog
+from simplyprint_duet3d.watchdog import Watchdog
 
 def test_watchdog_basic_reset_and_stop():
     wd = Watchdog(timeout=2)
@@ -20,7 +20,7 @@ def test_watchdog_triggers_interrupt(monkeypatch):
     def fake_interrupt_main():
         triggered.append(True)
 
-    monkeypatch.setattr("meltingplot.duet_simplyprint_connector.watchdog._thread.interrupt_main", fake_interrupt_main)
+    monkeypatch.setattr("simplyprint_duet3d.watchdog._thread.interrupt_main", fake_interrupt_main)
     wd = Watchdog(timeout=0.5)
     wd.start()
     time.sleep(2)
@@ -75,7 +75,7 @@ def test_watchdog_async_reset_multithreaded(monkeypatch):
     def fake_interrupt_main():
         triggered.append(True)
 
-    monkeypatch.setattr("meltingplot.duet_simplyprint_connector.watchdog._thread.interrupt_main", fake_interrupt_main)
+    monkeypatch.setattr("simplyprint_duet3d.watchdog._thread.interrupt_main", fake_interrupt_main)
     wd = Watchdog(timeout=1)
     wd.start()
     wd.reset_sync(offset=5)  # Set initial offset to avoid immediate trigger

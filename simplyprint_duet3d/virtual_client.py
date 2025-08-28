@@ -183,8 +183,8 @@ class VirtualClient(DefaultClient[VirtualConfig]):
         """Set the firmware information."""
         self.printer.firmware.name = board['firmwareName']
         self.printer.firmware.version = board['firmwareVersion']
-        self.printer.set_api_info("meltingplot.duet-simplyprint-connector", __version__)
-        self.printer.set_ui_info("meltingplot.duet-simplyprint-connector", __version__)
+        self.printer.set_api_info("Duet", __version__)
+        self.printer.set_ui_info("Duet", __version__)
 
     async def _duet_on_objectmodel(self, old_om) -> None:
         """Handle Objectmodel changes."""
