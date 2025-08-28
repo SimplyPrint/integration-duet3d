@@ -12,7 +12,7 @@ class Watchdog:
     def __init__(self, timeout: float):
         """Initialize the watchdog with a timeout in seconds."""
         self.timeout = timeout
-        self._last_reset = time.monotonic()
+        self._next_reset = time.monotonic() + self.timeout
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._watchdog_thread, daemon=True)
@@ -29,20 +29,21 @@ class Watchdog:
     async def reset(self):
         """Reset the watchdog timer asynchronously."""
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._reset_sync)
+        await loop.run_in_executor(None, self.reset_sync)
 
-    def _reset_sync(self):
+    def reset_sync(self, offset: float = 0):
         """Reset the watchdog timer synchronously."""
         with self._lock:
-            self._last_reset = time.monotonic()
+            self._next_reset = time.monotonic() + self.timeout + offset
 
     def _watchdog_thread(self):
         """Thread that checks the watchdog timer."""
         while not self._stop_event.is_set():
+            due = False
             with self._lock:
-                elapsed = time.monotonic() - self._last_reset
-            if elapsed > self.timeout:
+                due = self._next_reset - time.monotonic() <= 0
+            if due:
                 # Raise KeyboardInterrupt in main thread
                 _thread.interrupt_main()
                 break
-            time.sleep(0.1)
+            time.sleep(1)  # Sleep for a short duration to avoid busy waiting

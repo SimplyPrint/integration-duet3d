@@ -97,14 +97,14 @@ def run_app(autodiscover, app, profile, watchdog: Watchdog):
 
         atexit.register(app_exit)
 
-    watchdog._reset_sync()  # Reset the watchdog timer
+    watchdog.reset_sync(offset=600)  # Reset the watchdog timer
     watchdog.start()  # Start the watchdog to start the timer
     app.run_blocking()
 
 
 def main():
     """Initiate the connector as the main entry point."""
-    watchdog = Watchdog(timeout=60)
+    watchdog = Watchdog(timeout=300)
     VirtualClient.watchdog = watchdog
 
     settings = ClientSettings(
