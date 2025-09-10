@@ -25,11 +25,11 @@ from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.state import FilamentSensorEnum, FileProgressStateEnum, PrinterStatus
 from simplyprint_ws_client.core.state.models import NotificationEventButtonAction
 from simplyprint_ws_client.core.ws_protocol.messages import (
+    ConnectedMsg,
     FileDemandData,
     GcodeDemandData,
     MeshDataMsg,
     PrinterSettingsMsg,
-    ConnectedMsg,
 )
 from simplyprint_ws_client.shared.camera.mixin import ClientCameraMixin
 from simplyprint_ws_client.shared.files.file_download import FileDownload
