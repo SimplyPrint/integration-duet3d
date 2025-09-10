@@ -201,6 +201,8 @@ class VirtualClient(DefaultClient[VirtualConfig]):
         if await self._is_printing():
             await self._update_job_info()
 
+        await self._handle_heater_faults(old_om=old_om)
+
     @async_task
     async def _duet_printer_task(self):
         """Duet Printer task."""
@@ -502,6 +504,20 @@ class VirtualClient(DefaultClient[VirtualConfig]):
         """Cancel the print job."""
         await self.duet.gcode('M25')
         await self.duet.gcode('M0')
+
+    async def _handle_heater_faults(self, old_om) -> None:
+        """Handle heater faults."""
+        heaters = self.duet.om.get('heat', {}).get('heaters', [])
+        old_heaters = old_om.get('heat', {}).get('heaters', []) if old_om else []
+        for idx, heater in enumerate(heaters):
+            if heater.state == 'fault' and (
+                len(old_heaters) != len(heaters)
+                or idx <= len(old_heaters) and old_heaters[idx].get('state') != 'fault'
+            ):
+                self.logger.error(f"Heater {idx} is in fault state")
+                self.printer.status = PrinterStatus.ERROR
+                # TODO: notify SP about the error
+                # reset the error with f"M562 P{idx}"
 
     async def _update_temperatures(self) -> None:
         """Update the printer temperatures."""

@@ -150,3 +150,99 @@ def test_merge(source, destination, expected):
     """Test the merge function."""
     result = merge_dictionary(source, destination)
     assert result == expected
+
+@pytest.mark.asyncio
+async def test_handle_heater_faults_sets_error_status_on_new_fault(virtual_client):
+    # Arrange
+    virtual_client.logger = Mock()
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+
+    # Simulate duet.om with heaters, one in 'fault' state
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'heat': {
+            'heaters': [
+                Mock(state='fault'),
+                Mock(state='active'),
+            ]
+        }
+    }
+
+    # old_om: previous state, no faults
+    old_om = {
+        'heat': {
+            'heaters': [
+                {'state': 'active'},
+                {'state': 'active'},
+            ]
+        }
+    }
+
+    # Act
+    await virtual_client._handle_heater_faults(old_om)
+
+    # Assert
+    assert virtual_client.printer.status == PrinterStatus.ERROR
+    virtual_client.logger.error.assert_called_with("Heater 0 is in fault state")
+
+@pytest.mark.asyncio
+async def test_handle_heater_faults_no_error_if_fault_already_present(virtual_client):
+    # Arrange
+    virtual_client.logger = Mock()
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'heat': {
+            'heaters': [
+                Mock(state='fault'),
+                Mock(state='active'),
+            ]
+        }
+    }
+
+    # old_om: previous state, already in fault
+    old_om = {
+        'heat': {
+            'heaters': [
+                {'state': 'fault'},
+                {'state': 'active'},
+            ]
+        }
+    }
+
+    # Act
+    await virtual_client._handle_heater_faults(old_om)
+
+    # Assert
+    # Should not set error again or log error
+    assert virtual_client.printer.status == PrinterStatus.OPERATIONAL
+    virtual_client.logger.error.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_handle_heater_faults_handles_missing_old_om(virtual_client):
+    # Arrange
+    virtual_client.logger = Mock()
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'heat': {
+            'heaters': [
+                Mock(state='fault'),
+            ]
+        }
+    }
+
+    # old_om is None
+    old_om = None
+
+    # Act
+    await virtual_client._handle_heater_faults(old_om)
+
+    # Assert
+    assert virtual_client.printer.status == PrinterStatus.ERROR
+    virtual_client.logger.error.assert_called_with("Heater 0 is in fault state")
