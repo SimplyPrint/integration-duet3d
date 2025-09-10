@@ -7,7 +7,7 @@ import aiohttp
 
 import pytest
 
-from .context import FileProgressStateEnum, VirtualClient, VirtualConfig
+from .context import FileProgressStateEnum, DuetPrinter, DuetPrinterConfig
 from simplyprint_ws_client.core.ws_protocol.messages import FileDemandData
 from simplyprint_ws_client.core.state import PrinterStatus
 from simplyprint_duet3d.duet.model import merge_dictionary
@@ -15,8 +15,8 @@ from simplyprint_duet3d.duet.model import merge_dictionary
 @pytest.fixture
 def virtual_client():
     """Return a VirtualClient instance."""
-    config = VirtualConfig(
-        id="virtual",
+    config = DuetPrinterConfig(
+        id=1,
         token="token",
         unique_id="unique_id",
         duet_uri="http://example.com",
@@ -24,7 +24,7 @@ def virtual_client():
         duet_unique_id="unique_id",
         webcam_uri="http://webcam.example.com"
     )
-    client = VirtualClient(config=config)
+    client = DuetPrinter(config=config)
     return client
 
 @pytest.mark.skip

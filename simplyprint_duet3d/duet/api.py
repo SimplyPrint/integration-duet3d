@@ -51,7 +51,7 @@ def reauthenticate(retries=3):
 
 
 @attr.s
-class RepRapFirmware():
+class RepRapFirmware:
     """RepRapFirmware API Class."""
 
     address = attr.ib(type=str, default="http://10.42.0.2")
@@ -169,11 +169,11 @@ class RepRapFirmware():
         array: Optional[int] = 0,
     ) -> dict:
         """rr_model Get Machine Model."""
-        self.logger.debug(
-            f"rr_model: key={key}, frequently={frequently},"
-            f" verbose={verbose}, include_null={include_null},"
-            f" include_obsolete={include_obsolete}, depth={depth}, array={array}",
-        )
+        # self.logger.debug(
+        #     f"rr_model: key={key}, frequently={frequently},"
+        #     f" verbose={verbose}, include_null={include_null},"
+        #     f" include_obsolete={include_obsolete}, depth={depth}, array={array}",
+        # )
 
         await self._ensure_session()
 

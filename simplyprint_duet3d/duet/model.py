@@ -74,7 +74,7 @@ class DuetState(CamelCaseStrEnum):
 
 
 @define
-class DuetPrinter():
+class DuetPrinterModel:
     """Duet Printer model class."""
 
     api = field(type=RepRapFirmware, factory=RepRapFirmware)

@@ -7,5 +7,5 @@ sys.path.insert(
 
 from simplyprint_duet3d.duet.api import RepRapFirmware  # noqa
 from simplyprint_duet3d.gcode import GCodeCommand, GCodeBlock  # noqa
-from simplyprint_duet3d.virtual_client import VirtualClient, VirtualConfig, FileProgressStateEnum  # noqa
+from simplyprint_duet3d.printer import DuetPrinter, DuetPrinterConfig, FileProgressStateEnum  # noqa
 from simplyprint_duet3d.__main__ import rescan_existing_networks  # noqa

@@ -131,11 +131,12 @@ def normalize_url(url: str) -> str:
     return f'http://{url}'
 
 
-async def connect_to_duet(address: str, password: str) -> Optional[dict]:
+async def connect_to_duet(address: str, password: str, timeout=15) -> Optional[dict]:
     """Connect to a printer using the specified IP address and password."""
     duet = RepRapFirmware(
         address=normalize_url(address),
         password=password,
+        http_timeout=timeout,
     )
 
     try:
@@ -182,24 +183,37 @@ async def connect_to_range(
     password: str,
     ipv4_range: ipaddress.IPv4Network,
     ipv6_range: ipaddress.IPv6Network,
+    timeout=15,
 ) -> list:
     """Connect to all devices within the specified IP ranges."""
     tasks = []
     for ipv4 in ipv4_range:
-        tasks.append(connect_to_duet(f"{ipv4}", password))
+        tasks.append(connect_to_duet(f"{ipv4}", password, timeout))
     for ipv6 in ipv6_range:
-        tasks.append(connect_to_duet(f"[{ipv6}]", password))
+        tasks.append(connect_to_duet(f"[{ipv6}]", password, timeout))
+
+    tasks = [asyncio.create_task(task) for task in tasks]
+
+    async def tasks_progress_logger():
+        all_completed = all(task.done() for task in tasks)
+        while not all_completed:
+            completed = sum(1 for task in tasks if task.done())
+            click.echo(f"Progress: {completed}/{len(tasks)} tasks completed")
+            await asyncio.sleep(2)
+            all_completed = all(task.done() for task in tasks)
+
+    asyncio.create_task(tasks_progress_logger())
 
     return await asyncio.gather(*tasks)
 
 
-class AutoDiscover():
+class AutoDiscover:
     """
     A class to handle the autodiscovery of devices within specified IP ranges.
 
     Attributes:
         app (ClientApp): The application instance.
-        autodiscover (click.Command): The Click command for autodiscovery.
+        command (click.Command): The Click command for autodiscovery.
 
     Methods:
         __init__(app: ClientApp) -> None:
@@ -214,8 +228,7 @@ class AutoDiscover():
         ipv4_range = ipaddress.ip_network(netinfo.ip).supernet(new_prefix=24)
         default_ipv4_range = f"{ipv4_range}"
 
-        self._autodiscover = self.autodiscover
-        self.autodiscover = click.Command(
+        self.command = click.Command(
             name='autodiscover',
             callback=self.autodiscover,
             params=[
@@ -242,7 +255,7 @@ class AutoDiscover():
             ],
         )
 
-    def autodiscover(self, password, ipv4_range, ipv6_range):
+    def autodiscover(self, password, ipv4_range, ipv6_range, timeout=15):
         """Autodiscover devices in the specified IP range."""
         ipv4_addresses = convert_cidr_to_list(ipv4_range)
         ipv6_addresses = convert_cidr_to_list(ipv6_range)
@@ -252,7 +265,7 @@ class AutoDiscover():
             f'IPv4 range: {ipv4_range}, and IPv6 range: {ipv6_range}',
         )
 
-        responses = asyncio.run(connect_to_range(password, ipv4_addresses, ipv6_addresses))
+        responses = asyncio.run(connect_to_range(password, ipv4_addresses, ipv6_addresses, timeout))
 
         clients = {f"{client['duet_unique_id']}": client for client in responses if client is not None}
 

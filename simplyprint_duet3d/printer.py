@@ -1,5 +1,4 @@
 """A virtual client for the SimplyPrint.io Service."""
-
 import asyncio
 import io
 import json
@@ -12,39 +11,43 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Optional
 
 import aiohttp
 
 import psutil
 
+from simplyprint_ws_client import NotificationEventPayload, NotificationEventSeverity, ResolveNotificationDemandData
 from simplyprint_ws_client.const import VERSION as SP_VERSION
 from simplyprint_ws_client.core.client import ClientConfigChangedEvent, DefaultClient
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.state import FilamentSensorEnum, FileProgressStateEnum, PrinterStatus
+from simplyprint_ws_client.core.state.models import NotificationEventButtonAction
 from simplyprint_ws_client.core.ws_protocol.messages import (
     FileDemandData,
     GcodeDemandData,
     MeshDataMsg,
     PrinterSettingsMsg,
-    WebcamSnapshotDemandData,
 )
+from simplyprint_ws_client.shared.camera.mixin import ClientCameraMixin
 from simplyprint_ws_client.shared.files.file_download import FileDownload
 from simplyprint_ws_client.shared.hardware.physical_machine import PhysicalMachine
 
+from yarl import URL
+
 from . import __version__
 from .duet.api import RepRapFirmware
-from .duet.model import DuetPrinter
+from .duet.model import DuetPrinterModel
 from .gcode import GCodeBlock
 from .network import get_local_ip_and_mac
 from .state import map_duet_state_to_printer_status
 from .task import async_supress, async_task
 from .watchdog import Watchdog
-from .webcam import Webcam
 
 
 @dataclass
-class VirtualConfig(PrinterConfig):
+class DuetPrinterConfig(PrinterConfig):
     """Configuration for the VirtualClient."""
 
     duet_name: Optional[str] = None
@@ -54,16 +57,21 @@ class VirtualConfig(PrinterConfig):
     webcam_uri: Optional[str] = None
 
 
-class VirtualClient(DefaultClient[VirtualConfig]):
+class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinterConfig]):
     """A Websocket client for the SimplyPrint.io Service."""
 
-    duet: DuetPrinter
+    duet: DuetPrinterModel
     watchdog: Watchdog
-    _webcam: Webcam
 
     def __init__(self, *args, **kwargs) -> None:
         """Initialize the client."""
         super().__init__(*args, **kwargs)
+
+        self.initialize_camera_mixin(
+            pause_timeout=10,
+            max_cache_age=timedelta(seconds=1),
+            **kwargs,
+        )
 
     async def init(self) -> None:
         """Initialize the client."""
@@ -71,7 +79,9 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         try:
             await self._initialize_tasks()
-            self._webcam = Webcam(client=self, uri=self.config.webcam_uri)
+            self.camera_uri = URL(self.config.webcam_uri) if self.config.webcam_uri else None
+            print(f"Camera status is: {self.camera_status=}")
+
             await self._initialize_printer_info()
             await self._initialize_duet()
         except Exception as e:
@@ -96,7 +106,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         self._printer_timeout = time.time() + 60 * 5  # 5 minutes
 
-        self.duet = DuetPrinter(
+        self.duet = DuetPrinterModel(
             logger=self.logger.getChild('duet'),
             api=duet_api,
         )
@@ -124,12 +134,17 @@ class VirtualClient(DefaultClient[VirtualConfig]):
             self.printer.info.machine = PhysicalMachine.machine()
         self.printer.webcam_info.connected = self.config.webcam_uri is not None
 
+    async def _notify_with_setup_code(self) -> str:
+        r = await self.duet.gcode(
+            f'M291 P"Code: {self.config.short_id}" R"SimplyPrint.io Setup" S2',
+        )
+
+        return r
+
     async def _duet_on_connect(self) -> None:
         """Connect to the Duet board."""
         if self.config.in_setup:
-            await self.duet.gcode(
-                f'M291 P"Code: {self.config.short_id}" R"SimplyPrint.io Setup" S2',
-            )
+            await self._notify_with_setup_code()
         else:
             await self._check_and_set_cookie()
 
@@ -147,10 +162,6 @@ class VirtualClient(DefaultClient[VirtualConfig]):
     async def _duet_on_state(self, old_state) -> None:
         """Handle State changes."""
         self.logger.debug(f"Duet state changed from {old_state} to {self.duet.state}")
-
-        # send a snapshot without request to get in sync with SP
-        # TODO: remove this when it is fixed in SP
-        await self._webcam.request_snapshot()
 
     async def _set_duet_unique_id(self, board: dict) -> None:
         """Set the unique ID if it is not set and emit an event to notify the client."""
@@ -193,10 +204,12 @@ class VirtualClient(DefaultClient[VirtualConfig]):
         await self._mesh_compensation_status(old_om=old_om)
 
         try:
-            await self._update_temperatures()
+            self._update_temperatures()
         except KeyError:
-            self.printer.bed_temperature.actual = 0.0
-            self.printer.tool_temperatures[0].actual = 0.0
+            self.printer.bed.temperature.actual = 0.0
+            self.printer.tool0.actual = 0.0
+
+        self._update_heater_fault_notifications()
 
         if await self._is_printing():
             await self._update_job_info()
@@ -249,8 +262,6 @@ class VirtualClient(DefaultClient[VirtualConfig]):
 
         await self._duet_printer_task()
         await self._connector_status_task()
-        # send first snapshot without request
-        await self._webcam.request_snapshot()
 
     async def on_remove_connection(self, _) -> None:
         """Remove the connection."""
@@ -330,9 +341,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
                 response.append(await self.duet.gcode(item.compress()))
             elif item.code == 'M300' and self.config.in_setup:
                 response.append(
-                    await self.duet.gcode(
-                        f'M291 P"SimplyPrint.io Code: {self.config.short_id}" R"SimplyPrint Identification" S2',
-                    ),
+                    await self._notify_with_setup_code(),
                 )
             elif item.code == 'M997':
                 await self._perform_self_upgrade()
@@ -486,7 +495,7 @@ class VirtualClient(DefaultClient[VirtualConfig]):
     async def on_start_print(self, _) -> None:
         """Start the print job."""
         await self.duet.gcode(
-            f'M23 "0:/gcodes/{self.printer.job_info.filename.root}"',
+            f'M23 "0:/gcodes/{self.printer.job_info.filename}"',
         )
         await self.duet.gcode('M24')
 
@@ -503,22 +512,53 @@ class VirtualClient(DefaultClient[VirtualConfig]):
         await self.duet.gcode('M25')
         await self.duet.gcode('M0')
 
-    async def _update_temperatures(self) -> None:
+    def _update_temperatures(self) -> None:
         """Update the printer temperatures."""
         heaters = self.duet.om['heat']['heaters']
         bed_heater_index = self.duet.om['heat']['bedHeaters'][0]
 
-        self.printer.bed_temperature.actual = heaters[bed_heater_index]['current']
-        self.printer.bed_temperature.target = (
+        self.printer.bed.temperature.actual = heaters[bed_heater_index]['current']
+        self.printer.bed.temperature.target = (
             heaters[bed_heater_index]['active'] if heaters[0]['state'] != 'off' else 0.0
         )
 
-        for tool_idx, tool_temperature in enumerate(self.printer.tool_temperatures):
+        self.printer.tool_count = len(self.duet.om['tools']) or 1
+
+        for tool_idx, tool in enumerate(self.printer.tools):
             heater_idx = self.duet.om['tools'][tool_idx]['heaters'][0]
-            tool_temperature.actual = heaters[heater_idx]['current']
-            tool_temperature.target = (heaters[heater_idx]['active'] if heaters[1]['state'] != 'off' else 0.0)
+            tool.temperature.actual = heaters[heater_idx]['current']
+            tool.temperature.target = (heaters[heater_idx]['active'] if heaters[1]['state'] != 'off' else 0.0)
 
         self.printer.ambient_temperature.ambient = 20
+
+    def _update_heater_fault_notifications(self):
+        heaters = self.duet.om['heat']['heaters']
+        retained_events = []
+
+        for heater_idx, heater in enumerate(heaters):
+            if heater['state'] != 'fault':
+                continue
+
+            event_key = ("heater_fault", heater_idx)
+
+            _ = self.printer.notifications.keyed(
+                event_key,
+                severity=NotificationEventSeverity.ERROR,
+                payload=NotificationEventPayload(
+                    title="Heater Fault",
+                    message=f"Heater fault on heater {heater_idx}. Only clear the fault if you are sure it is safe!",
+                    data={"heater": heater_idx},
+                    actions={"reset": NotificationEventButtonAction(label="Reset fault")},
+                ),
+            )
+
+            retained_events.append(event_key)
+
+        # Only keep heater fault events that are still active.
+        self.printer.notifications.filter_retain_keys(
+            lambda x: isinstance(x, tuple) and x[0] == "heater_fault",
+            *retained_events,
+        )
 
     async def _check_and_set_cookie(self) -> None:
         """Check if the cookie is set and set it if it is not."""
@@ -678,7 +718,11 @@ class VirtualClient(DefaultClient[VirtualConfig]):
     async def _update_job_filename(self, job_status: dict) -> None:
         try:
             filepath = job_status['file']['fileName']
-            self.printer.job_info.filename = pathlib.PurePath(filepath).name
+            filename = pathlib.PurePath(filepath).name
+
+            if self.printer.job_info.filename != filename:
+                self.printer.job_info.filename = filename
+
             if job_status.get('duration', 0) < 10:
                 self.printer.job_info.started = True
         except (TypeError, KeyError):
@@ -706,29 +750,34 @@ class VirtualClient(DefaultClient[VirtualConfig]):
             task.cancel()
         await self.duet.close()
 
-    async def teardown(self) -> None:
-        """Teardown the client."""
-        pass
-
-    async def on_webcam_test(self) -> None:
-        """Test the webcam."""
-        await self._webcam.request_snapshot()
-        self.printer.webcam_info.connected = (True if self.config.webcam_uri is not None else False)
-
-    async def on_webcam_snapshot(
-        self,
-        event: WebcamSnapshotDemandData,
-    ) -> None:
-        """Take a snapshot from the webcam."""
-        await self._webcam.request_snapshot(snapshot_id=event.id, endpoint=event.endpoint)
-
-    async def on_stream_off(self) -> None:
-        """Turn off the webcam stream."""
-        pass
-
     async def on_api_restart(self) -> None:
         """Restart the API."""
         self.logger.info("Restarting API")
         # the api is running as a systemd service, so we can just restart the service
         # by terminating the process
         raise KeyboardInterrupt()
+
+    async def on_resolve_notification(self, data: ResolveNotificationDemandData):
+        """Handle notification resolution events."""
+        event = self.printer.notifications.notifications.get(data.event_id)
+        if not event:
+            return
+
+        # Handle heater fault reset action.
+        if data.action == "reset" and event.payload.data.get("heater") is not None:
+            heater_idx = event.payload.data["heater"]
+            tools = self.duet.om['tools']
+            bed_heater_index = self.duet.om['heat']['bedHeaters'][0]
+
+            # Reset heater fault
+            await self.duet.gcode(f"M562 P{heater_idx}")
+
+            # Reactivate the heater
+            if heater_idx == bed_heater_index:
+                # Make bed active.
+                await self.duet.gcode("M144 S1")
+            else:
+                for tool_idx, tool in enumerate(tools):
+                    if heater_idx in tool['heaters']:
+                        # Make tool active.
+                        await self.duet.gcode(f"M568 P{tool_idx} A2")
