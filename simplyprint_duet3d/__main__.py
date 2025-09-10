@@ -116,7 +116,7 @@ def main():
         config_manager_t=ConfigManagerType.JSON,
         camera_workers=1,
         camera_protocols=[DuetSnapshotCamera],
-        development=True,
+        development=False,
     )
 
     setup_logging(settings)

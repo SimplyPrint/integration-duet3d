@@ -29,6 +29,7 @@ from simplyprint_ws_client.core.ws_protocol.messages import (
     GcodeDemandData,
     MeshDataMsg,
     PrinterSettingsMsg,
+    ConnectedMsg,
 )
 from simplyprint_ws_client.shared.camera.mixin import ClientCameraMixin
 from simplyprint_ws_client.shared.files.file_download import FileDownload
@@ -80,8 +81,6 @@ class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinte
         try:
             await self._initialize_tasks()
             self.camera_uri = URL(self.config.webcam_uri) if self.config.webcam_uri else None
-            print(f"Camera status is: {self.camera_status=}")
-
             await self._initialize_printer_info()
             await self._initialize_duet()
         except Exception as e:
@@ -253,9 +252,9 @@ class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinte
             await asyncio.sleep(30)
             raise TimeoutError
 
-    async def on_connected(self, _) -> None:
+    async def on_connected(self, data: ConnectedMsg) -> None:
         """Connect to SimplyPrint.io."""
-        self.logger.info('Connected to SimplyPrint.io')
+        self.logger.info(f'Connected to SimplyPrint.io name={data.data.name} setup_code={data.data.short_id}')
 
         self.use_running_loop()
         self._is_stopped = False
