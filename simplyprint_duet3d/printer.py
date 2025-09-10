@@ -533,6 +533,9 @@ class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinte
 
     def _update_heater_fault_notifications(self):
         heaters = self.duet.om['heat']['heaters']
+        bed_heater_index = self.duet.om['heat']['bedHeaters'][0]
+        heater_idx_to_tool_idx = {tool['heaters'][0]: tool_idx for tool_idx, tool in enumerate(self.duet.om['tools'])}
+
         retained_events = []
 
         for heater_idx, heater in enumerate(heaters):
@@ -540,13 +543,20 @@ class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinte
                 continue
 
             event_key = ("heater_fault", heater_idx)
+            description = f"heater {heater_idx}"
+
+            if heater_idx == bed_heater_index:
+                description = "bed"
+            elif heater_idx in heater_idx_to_tool_idx:
+                tool_idx = heater_idx_to_tool_idx[heater_idx]
+                description = f"nozzle {tool_idx}"
 
             _ = self.printer.notifications.keyed(
                 event_key,
                 severity=NotificationEventSeverity.ERROR,
                 payload=NotificationEventPayload(
                     title="Heater Fault",
-                    message=f"Heater fault on heater {heater_idx}. Only clear the fault if you are sure it is safe!",
+                    message=f"Heater fault on {description}. Only clear the fault if you are sure it is safe!",
                     data={"heater": heater_idx},
                     actions={"reset": NotificationEventButtonAction(label="Reset fault")},
                 ),

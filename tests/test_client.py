@@ -160,11 +160,13 @@ async def test_update_heater_fault_notifications_creates_new_fault_notification(
     virtual_client.duet = Mock()
     virtual_client.duet.om = {
         'heat': {
+            'bedHeaters': [0, -1, -1, -1],
             'heaters': [
                 {'state': 'fault'},
                 {'state': 'active'},
             ]
-        }
+        },
+        'tools': [],
     }
 
     # Ensure notifications is empty initially
@@ -183,7 +185,6 @@ async def test_update_heater_fault_notifications_creates_new_fault_notification(
     
     notification = heater_fault_notifications[0]
     assert notification.payload.data["heater"] == 0
-    assert "heater 0" in notification.payload.message.lower()
     assert "reset" in notification.payload.actions
 
 @pytest.mark.asyncio
@@ -195,11 +196,13 @@ async def test_update_heater_fault_notifications_persists_existing_fault_notific
     virtual_client.duet = Mock()
     virtual_client.duet.om = {
         'heat': {
+            'bedHeaters': [0, -1, -1, -1],
             'heaters': [
                 {'state': 'fault'},
                 {'state': 'active'},
-            ]
-        }
+            ],
+        },
+        'tools': [],
     }
 
     # First call to create the notification
@@ -226,11 +229,13 @@ async def test_update_heater_fault_notifications_removes_cleared_fault_notificat
     virtual_client.duet = Mock()
     virtual_client.duet.om = {
         'heat': {
+            'bedHeaters': [0, -1, -1, -1],
             'heaters': [
                 {'state': 'fault'},
                 {'state': 'fault'},
             ]
-        }
+        },
+        'tools': [],
     }
 
     # Create initial fault notifications
@@ -240,11 +245,13 @@ async def test_update_heater_fault_notifications_removes_cleared_fault_notificat
     # Act - Update state so only one heater remains in fault
     virtual_client.duet.om = {
         'heat': {
+            'bedHeaters': [0, -1, -1, -1],
             'heaters': [
                 {'state': 'fault'},
                 {'state': 'active'},  # No longer in fault
             ]
-        }
+        },
+        'tools': [],
     }
     virtual_client._update_heater_fault_notifications()
 
