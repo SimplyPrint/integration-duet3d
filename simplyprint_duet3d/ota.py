@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 from importlib import metadata
+from typing import Optional
 
 
 def in_virtual_env() -> bool:
@@ -39,11 +40,11 @@ def _dist_for_import_name(import_name: str) -> str:
 
 def self_update(
     import_name: str,
-    version_spec: str | None = None,
+    version_spec: Optional[str] = None,
     allow_system: bool = False,
     pre: bool = False,
-    index_url: str | None = None,
-    extra_index_url: str | None = None,
+    index_url: Optional[str] = None,
+    extra_index_url: Optional[str] = None,
 ) -> int:
     """Update the installed package that provides `import_name` using pip.
 
