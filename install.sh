@@ -31,6 +31,6 @@ cd /opt/duet-simplyprint-connector
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip setuptools wheel
-pip install --upgrade --extra-index-url https://www.piwheels.org/simple --only-binary=:all: simplyprint-duet3d
+pip install --upgrade --extra-index-url https://www.piwheels.org/simple simplyprint-duet3d
 simplyprint-duet3d autodiscover
 simplyprint-duet3d install-as-service

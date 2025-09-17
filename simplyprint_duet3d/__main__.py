@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import click
 import PIL  # noqa
 
+from simplyprint_ws_client.const import IS_TESTING
 from simplyprint_ws_client.core.app import ClientApp
 from simplyprint_ws_client.core.config import ConfigManagerType
 from simplyprint_ws_client.core.settings import ClientSettings
@@ -116,7 +117,7 @@ def main():
         config_manager_t=ConfigManagerType.JSON,
         camera_workers=1,
         camera_protocols=[DuetSnapshotCamera],
-        development=False,
+        development=IS_TESTING,
     )
 
     setup_logging(settings)
