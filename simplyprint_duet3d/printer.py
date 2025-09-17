@@ -29,6 +29,7 @@ from simplyprint_ws_client.core.ws_protocol.messages import (
     FileDemandData,
     GcodeDemandData,
     MeshDataMsg,
+    PluginInstallDemandData,
     PrinterSettingsMsg,
 )
 from simplyprint_ws_client.shared.camera.mixin import ClientCameraMixin
@@ -37,7 +38,7 @@ from simplyprint_ws_client.shared.hardware.physical_machine import PhysicalMachi
 
 from yarl import URL
 
-from . import __version__
+from . import __version__, ota
 from .duet.api import RepRapFirmware
 from .duet.model import DuetPrinterModel
 from .gcode import GCodeBlock
@@ -790,3 +791,27 @@ class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinte
                     if heater_idx in tool['heaters']:
                         # Make tool active.
                         await self.duet.gcode(f"M568 P{tool_idx} A2")
+
+    async def on_plugin_install(self, event: PluginInstallDemandData) -> None:
+        """Handle plugin installation demand event."""
+        # XXX: Least thread-safe code on the planet.
+        plugin = event.plugins.pop()
+
+        if plugin.get("type") != "install" and plugin.get("name") != "simplyprint-duet3d":
+            self.logger.warning(f"Plugin install demand received for {plugin}, but it is not supported.")
+            return
+
+        ret = ota.self_update("simplyprint_duet3d", extra_index_url="https://www.piwheels.org/simple")
+
+        if ret == 0:
+            self.logger.info("Plugin updated successfully, restarting API.")
+            await self.on_api_restart()
+            return
+
+        await self.push_notification(
+            severity=NotificationEventSeverity.WARNING,
+            payload=NotificationEventPayload(
+                title="Failed to update plugin",
+                message="An error occurred while updating the SimplyPrint Duet3D plugin. Please check the logs.",
+            ),
+        )
