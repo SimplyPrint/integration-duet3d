@@ -1,13 +1,15 @@
 [Unit]
 Description=Meltingplot Duet <-> SimplyPrint.io connector
 After=network.target
+StartLimitIntervalSec=2min
+StartLimitBurst=5
 
 [Service]
 Type=simple
 Restart=always
 StartLimitInterval=0
 StartLimitBurst=1440
-RestartSec=60
+RestartSec=5s
 ExecStart=/usr/local/bin/simplyprint-duet3d start
 WorkingDirectory=/usr/local
 User=ubuntu
