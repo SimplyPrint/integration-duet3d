@@ -1,4 +1,5 @@
 """GCode parsing and writing utilities."""
+
 import re
 from typing import List, TextIO
 
@@ -11,7 +12,7 @@ import attr
 
 
 @attr.s
-class GCodeCommand():
+class GCodeCommand:
     """A single GCode command."""
 
     code = attr.ib(type=str)
@@ -20,49 +21,49 @@ class GCodeCommand():
 
     def compress(self) -> str:
         """Compress the GCodeCommand into a single line without comments."""
-        gcode_line = '{0} {1}'.format(
+        gcode_line = "{0} {1}".format(
             self.code,
-            ' '.join(self.parameters),
+            " ".join(self.parameters),
         )
-        if gcode_line == ' ':
-            gcode_line = ''
+        if gcode_line == " ":
+            gcode_line = ""
 
         return gcode_line
 
     def write(self, fp: TextIO) -> None:
         """Write the GCodeCommand to a file-like object."""
-        gcode_line = '{0} {1}'.format(
+        gcode_line = "{0} {1}".format(
             self.code,
-            ' '.join(self.parameters),
+            " ".join(self.parameters),
         )
-        if gcode_line == ' ':
-            gcode_line = ''
+        if gcode_line == " ":
+            gcode_line = ""
 
         if len(self.comment) > 1:
             fp.write(gcode_line.rstrip())
             if len(self.code) > 0:
-                fp.write(' ; '.rjust(max(1, 60 - len(gcode_line))))
+                fp.write(" ; ".rjust(max(1, 60 - len(gcode_line))))
             fp.write(self.comment[0])
-            fp.write('\n')
+            fp.write("\n")
             for c in self.comment[1:]:
-                fp.write('; '.rjust(60))
+                fp.write("; ".rjust(60))
                 fp.write(c)
-                fp.write('\n')
+                fp.write("\n")
         elif len(self.comment) == 1:
             fp.write(gcode_line.rstrip())
             if len(self.code) > 0:
-                fp.write(' ; '.rjust(max(1, 60 - len(gcode_line))))
+                fp.write(" ; ".rjust(max(1, 60 - len(gcode_line))))
             else:
-                fp.write(';')
+                fp.write(";")
             fp.write(self.comment[0])
-            fp.write('\n')
+            fp.write("\n")
         else:
             fp.write(gcode_line.rstrip())
-            fp.write('\n')
+            fp.write("\n")
 
 
 @attr.s
-class GCodeBlock():
+class GCodeBlock:
     """A block of GCode commands."""
 
     comment = attr.ib(type=List[str], factory=list)
@@ -71,14 +72,14 @@ class GCodeBlock():
     def write(self, fp: TextIO) -> None:
         """Write the GCodeBlock to a file-like object."""
         if len(self.comment) > 0:
-            fp.write('; ')
-            fp.write('\n; '.join(self.comment))
-            fp.write('\n')
+            fp.write("; ")
+            fp.write("\n; ".join(self.comment))
+            fp.write("\n")
 
         for code in self.code:
             code.write(fp)
 
-        fp.write('\n')
+        fp.write("\n")
 
     def parse(self, lines: List) -> Self:
         """Parse a list of lines into a GCodeBlock."""
@@ -94,8 +95,8 @@ class GCodeBlock():
             line_gcode = gcode_match.group(1).strip()
             line_comment = gcode_match.group(2)
 
-            if line_comment != '':
-                if line_gcode == '' and (len(line) - len(line.lstrip())) >= 4:
+            if line_comment != "":
+                if line_gcode == "" and (len(line) - len(line.lstrip())) >= 4:
                     try:
                         self.code[-1].comment.append(line_comment.strip())
                     except IndexError:
@@ -103,27 +104,27 @@ class GCodeBlock():
                 else:
                     current_comment.append(line_comment.strip())
 
-            if line_gcode != '':
-                gcode = line_gcode.split(' ')
+            if line_gcode != "":
+                gcode = line_gcode.split(" ")
                 self.code.append(
                     GCodeCommand(
                         code=gcode[0],
                         comment=current_comment,
-                        parameters=[' '.join(gcode[1:])],
+                        parameters=[" ".join(gcode[1:])],
                     ),
                 )
                 current_comment = []
-            elif len(line_comment) > 0 and line_comment[0] in ['G', 'M', 'T']:
+            elif len(line_comment) > 0 and line_comment[0] in ["G", "M", "T"]:
                 # this is a hidden/disabled gcode line and not a comment
                 self.code.append(
                     GCodeCommand(
-                        code='',
+                        code="",
                         comment=current_comment,
-                        parameters='',
+                        parameters="",
                     ),
                 )
                 current_comment = []
-            if line_gcode == '' and len(self.code) == 0:
+            if line_gcode == "" and len(self.code) == 0:
                 # comment only block
                 self.comment.extend(current_comment)
                 current_comment = []

@@ -26,18 +26,18 @@ class DuetSnapshotCamera(BaseCameraProtocol):
     @staticmethod
     def test(uri: URL) -> Union[bool, Coroutine[None, None, bool]]:
         """Test if the URI is supported by this camera protocol."""
-        return uri.scheme in ('http', 'https')
+        return uri.scheme in ("http", "https")
 
     def read(self):
         """Read an image from the webcam."""
         r = requests.get(str(self.uri))
-        content_type = r.headers['Content-Type'].lower()
+        content_type = r.headers["Content-Type"].lower()
         raw_data = None
 
-        if 'multipart' in content_type:
+        if "multipart" in content_type:
             dec = decoder.MultipartDecoder.from_response(r)
             for part in dec.parts:
-                if part.headers[b'Content-Type'].lower() != b'image/jpeg':
+                if part.headers[b"Content-Type"].lower() != b"image/jpeg":
                     continue
                 raw_data = part.content
                 break
@@ -45,11 +45,13 @@ class DuetSnapshotCamera(BaseCameraProtocol):
             raw_data = r.content
 
         if raw_data is None:
-            raise CameraProtocolConnectionError("No image data received from the camera.")
+            raise CameraProtocolConnectionError(
+                "No image data received from the camera.",
+            )
 
         img = iio.imread(
             uri=raw_data,
-            extension='.jpeg',
+            extension=".jpeg",
             index=None,
         )
 

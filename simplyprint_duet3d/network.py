@@ -24,13 +24,13 @@ def get_local_ip_and_mac() -> NetworkInfo:
         s.connect(("168.119.98.102", 80))
         local_ip = s.getsockname()[0]
     except socket.error:
-        local_ip = '127.0.0.1'
+        local_ip = "127.0.0.1"
     finally:
         s.close()
 
     nics = psutil.net_if_addrs()
     for iface in nics:
-        if iface == 'lo':
+        if iface == "lo":
             continue
         mac = None
         found = False

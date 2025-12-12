@@ -19,30 +19,36 @@ def reauthenticate(retries=3):
     def decorator(f):
 
         async def inner(*args, **kwargs):
-            status = {'retries': retries}
-            while status['retries']:
+            status = {"retries": retries}
+            while status["retries"]:
                 try:
                     return await f(*args, **kwargs)
-                except (TimeoutError, aiohttp.ClientPayloadError, aiohttp.ClientConnectionError) as e:
+                except (
+                    TimeoutError,
+                    aiohttp.ClientPayloadError,
+                    aiohttp.ClientConnectionError,
+                ) as e:
                     args[0].logger.error(f"{e} - retry")
-                    status['retries'] -= 1
-                    await asyncio.sleep(5**(retries - status['retries']))
+                    status["retries"] -= 1
+                    await asyncio.sleep(5**(retries - status["retries"]))
                 except aiohttp.ClientResponseError as e:
-                    status['retries'] -= 1
+                    status["retries"] -= 1
                     if e.status in args[0].callbacks:
                         await args[0].callbacks[e.status](e)
                     elif e.status == 401:
                         args[0].logger.error(
-                            'Unauthorized  while requesting {!s} - retry'.format(e.request_info),
+                            "Unauthorized  while requesting {!s} - retry".format(
+                                e.request_info,
+                            ),
                         )
-                        await asyncio.sleep(5**(retries - status['retries']))
+                        await asyncio.sleep(5**(retries - status["retries"]))
                         response = await args[0].reconnect()
-                        if response['err'] == 0:
-                            status['retries'] = retries
+                        if response["err"] == 0:
+                            status["retries"] = retries
                     else:
                         raise e
             raise TimeoutError(
-                'Retried {} times to reauthenticate.'.format(retries),
+                "Retried {} times to reauthenticate.".format(retries),
             )
 
         return inner
@@ -63,7 +69,7 @@ class RepRapFirmware:
     logger = attr.ib(type=logging.Logger, factory=logging.getLogger)
     callbacks = attr.ib(type=dict, factory=dict)
     _reconnect_lock = attr.ib(type=asyncio.Lock, factory=asyncio.Lock)
-    _last_reply = attr.ib(type=str, default='')
+    _last_reply = attr.ib(type=str, default="")
     _last_reply_timeout = attr.ib(type=datetime.datetime, factory=datetime.datetime.now)
 
     def __attrs_post_init__(self):
@@ -74,20 +80,20 @@ class RepRapFirmware:
     async def _default_http_502_bad_gateway_callback(self, e):
         # a reverse proxy may return HTTP status code 502 if the Duet is not available
         # duet to open socket limit. In this case, we retry the request.
-        self.logger.error('Duet bad gateway  {!s} - retry'.format(e.request_info))
+        self.logger.error("Duet bad gateway  {!s} - retry".format(e.request_info))
         await asyncio.sleep(5)
 
     async def _default_http_503_busy_callback(self, e):
         # Besides, RepRapFirmware may run short on memory and
         # may not be able to respond properly. In this case,
         # HTTP status code 503 is returned.
-        self.logger.error('Duet busy  {!s} - retry'.format(e.request_info))
+        self.logger.error("Duet busy  {!s} - retry".format(e.request_info))
         await asyncio.sleep(5)
 
     @address.validator
     def _validate_address(self, attribute, value):
-        if not value.startswith('http://') and not value.startswith('https://'):
-            raise ValueError('Address must start with http:// or https://')
+        if not value.startswith("http://") and not value.startswith("https://"):
+            raise ValueError("Address must start with http:// or https://")
 
     async def connect(self) -> dict:
         """Connect to the Duet."""
@@ -99,14 +105,14 @@ class RepRapFirmware:
         if self._reconnect_lock.locked():
             # Wait for reconnect to finish
             async with self._reconnect_lock:
-                return {'err': 0}
+                return {"err": 0}
 
         async with self._reconnect_lock:
-            url = '{0}/rr_connect'.format(self.address)
+            url = "{0}/rr_connect".format(self.address)
 
             params = {
-                'password': self.password,
-                'sessionKey': 'yes',
+                "password": self.password,
+                "sessionKey": "yes",
             }
 
             if self.session is None or self.session.closed:
@@ -122,13 +128,13 @@ class RepRapFirmware:
                 json_response = await r.json()
 
             try:
-                if json_response['err'] == 0:
-                    if 'sessionKey' in json_response:
-                        self.session.headers['X-Session-Key'] = '{!s}'.format(
-                            json_response['sessionKey'],
+                if json_response["err"] == 0:
+                    if "sessionKey" in json_response:
+                        self.session.headers["X-Session-Key"] = "{!s}".format(
+                            json_response["sessionKey"],
                         )
-                    if 'sessionTimeout' in json_response:
-                        self.session_timeout = json_response['sessionTimeout']
+                    if "sessionTimeout" in json_response:
+                        self.session_timeout = json_response["sessionTimeout"]
             except KeyError as e:
                 raise e
 
@@ -144,7 +150,7 @@ class RepRapFirmware:
         """Disconnect from the Duet."""
         await self._ensure_session()
 
-        url = '{0}/rr_disconnect'.format(self.address)
+        url = "{0}/rr_disconnect".format(self.address)
 
         response = {}
         async with self.session.get(url) as r:
@@ -182,16 +188,16 @@ class RepRapFirmware:
         flags = []
 
         if frequently:
-            flags.append('f')
+            flags.append("f")
 
         if verbose:
-            flags.append('v')
+            flags.append("v")
 
         if include_null:
-            flags.append('n')
+            flags.append("n")
 
         if include_obsolete:
-            flags.append('o')
+            flags.append("o")
 
         flags.append(f"d{depth}")
 
@@ -199,8 +205,8 @@ class RepRapFirmware:
             flags.append(f"a{array}")
 
         params = {
-            'key': key if key is not None else '',
-            'flags': ''.join(flags),
+            "key": key if key is not None else "",
+            "flags": "".join(flags),
         }
 
         response = {}
@@ -213,17 +219,17 @@ class RepRapFirmware:
         """rr_gcode Send GCode to Duet."""
         await self._ensure_session()
 
-        url = '{0}/rr_gcode'.format(self.address)
+        url = "{0}/rr_gcode".format(self.address)
 
         params = {
-            'gcode': gcode,
+            "gcode": gcode,
         }
 
         async with self.session.get(url, params=params):
             pass
 
         if no_reply:
-            return ''
+            return ""
         else:
             return await self.rr_reply()
 
@@ -232,17 +238,19 @@ class RepRapFirmware:
         """rr_reply Get Reply from Duet."""
         await self._ensure_session()
 
-        url = '{0}/rr_reply'.format(self.address)
+        url = "{0}/rr_reply".format(self.address)
 
-        response = ''
+        response = ""
         async with self.session.get(url) as r:
             response = await r.text()
 
-        if nocache is False and response == '' and datetime.datetime.now() < self._last_reply_timeout:
+        if (nocache is False and response == "" and datetime.datetime.now() < self._last_reply_timeout):
             return self._last_reply
-        if nocache is False or response != '':  # Only cache if there is a new response
+        if nocache is False or response != "":  # Only cache if there is a new response
             self._last_reply = response
-        self._last_reply_timeout = datetime.datetime.now() + datetime.timedelta(seconds=10)
+        self._last_reply_timeout = datetime.datetime.now() + datetime.timedelta(
+            seconds=10,
+        )
         return response
 
     async def rr_download(
@@ -253,10 +261,10 @@ class RepRapFirmware:
         """rr_download Download File from Duet."""
         await self._ensure_session()
 
-        url = '{0}/rr_download'.format(self.address)
+        url = "{0}/rr_download".format(self.address)
 
         params = {
-            'name': filepath,
+            "name": filepath,
         }
 
         async with self.session.get(url, params=params) as r:
@@ -273,29 +281,34 @@ class RepRapFirmware:
         """rr_upload Upload File to Duet."""
         await self._ensure_session()
 
-        url = '{0}/rr_upload'.format(self.address)
+        url = "{0}/rr_upload".format(self.address)
 
         params = {
-            'name': filepath,
+            "name": filepath,
         }
 
         if last_modified is not None:
-            params['time'] = last_modified.isoformat(timespec='seconds')
+            params["time"] = last_modified.isoformat(timespec="seconds")
 
         try:
-            checksum = crc32(content) & 0xffffffff
+            checksum = crc32(content) & 0xFFFFFFFF
         except TypeError:
-            content = content.encode('utf-8')
-            checksum = crc32(content) & 0xffffffff
+            content = content.encode("utf-8")
+            checksum = crc32(content) & 0xFFFFFFFF
 
-        params['crc32'] = '{0:08x}'.format(checksum)
+        params["crc32"] = "{0:08x}".format(checksum)
 
         headers = {
-            'Content-Length': str(len(content)),
+            "Content-Length": str(len(content)),
         }
 
-        response = b''
-        async with self.session.post(url, data=content, params=params, headers=headers) as r:
+        response = b""
+        async with self.session.post(
+            url,
+            data=content,
+            params=params,
+            headers=headers,
+        ) as r:
             response = await r.json()
         return response
 
@@ -309,26 +322,26 @@ class RepRapFirmware:
         """rr_upload_stream Upload File to Duet."""
         await self._ensure_session()
 
-        url = '{0}/rr_upload'.format(self.address)
+        url = "{0}/rr_upload".format(self.address)
 
         params = {
-            'name': filepath,
+            "name": filepath,
         }
 
         if last_modified is not None:
-            params['time'] = last_modified.isoformat(timespec='seconds')
+            params["time"] = last_modified.isoformat(timespec="seconds")
 
         checksum = 0
         while chunk := file.read(8096):
-            checksum = crc32(chunk, checksum) & 0xffffffff
+            checksum = crc32(chunk, checksum) & 0xFFFFFFFF
             if progress:
                 progress(0.0)
 
-        checksum = checksum & 0xffffffff
+        checksum = checksum & 0xFFFFFFFF
         filesize = file.tell()
         file.seek(0)
 
-        params['crc32'] = '{0:08x}'.format(checksum)
+        params["crc32"] = "{0:08x}".format(checksum)
 
         async def file_chunk():
             while chunk := file.read(8096):
@@ -346,10 +359,10 @@ class RepRapFirmware:
         )
 
         headers = {
-            'Content-Length': str(filesize),
+            "Content-Length": str(filesize),
         }
 
-        response = b''
+        response = b""
         async with self.session.post(
             url=url,
             data=file_chunk(),
@@ -377,10 +390,10 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = '{0}/rr_filelist'.format(self.address)
+        url = "{0}/rr_filelist".format(self.address)
 
         params = {
-            'dir': directory,
+            "dir": directory,
         }
 
         response = {}
@@ -405,12 +418,12 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = '{0}/rr_fileinfo'.format(self.address)
+        url = "{0}/rr_fileinfo".format(self.address)
 
         params = {}
 
         if name is not None:
-            params['name'] = name
+            params["name"] = name
 
         response = {}
         async with self.session.get(url, params=params, **kwargs) as r:
@@ -431,10 +444,10 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = '{0}/rr_mkdir'.format(self.address)
+        url = "{0}/rr_mkdir".format(self.address)
 
         params = {
-            'dir': directory,
+            "dir": directory,
         }
 
         response = {}
@@ -465,12 +478,12 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = '{0}/rr_move'.format(self.address)
+        url = "{0}/rr_move".format(self.address)
 
         params = {
-            'old': old_filepath,
-            'new': new_filepath,
-            'deleteexisting': 'yes' if overwrite is True else 'no',
+            "old": old_filepath,
+            "new": new_filepath,
+            "deleteexisting": "yes" if overwrite is True else "no",
         }
 
         response = {}
@@ -492,10 +505,10 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = '{0}/rr_delete'.format(self.address)
+        url = "{0}/rr_delete".format(self.address)
 
         params = {
-            'name': filepath,
+            "name": filepath,
         }
 
         response = {}

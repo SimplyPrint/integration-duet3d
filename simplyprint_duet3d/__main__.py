@@ -1,4 +1,5 @@
 """Main entry point for the Duet SimplyPrint connector."""
+
 import ipaddress
 import logging
 import socket
@@ -43,17 +44,25 @@ def rescan_existing_networks(app):
                 if socktype == socket.SOCK_STREAM:
                     if family == socket.AF_INET:
                         ip_address = sockaddr[0]
-                        network = ipaddress.ip_network(ip_address, strict=False).supernet(new_prefix=24)
+                        network = ipaddress.ip_network(
+                            ip_address,
+                            strict=False,
+                        ).supernet(new_prefix=24)
                         break
                     elif family == socket.AF_INET6:
                         ip_address = sockaddr[0]
                         # Using /64 as prefix is to large as it includes 18,446,744,073,709,551,616 addresses
                         # Using /120 as prefix is small enough as it includes 256 addresses
-                        network = ipaddress.ip_network(ip_address, strict=False).supernet(new_prefix=120)
+                        network = ipaddress.ip_network(
+                            ip_address,
+                            strict=False,
+                        ).supernet(new_prefix=120)
                         break
         except (socket.gaierror, ValueError, TypeError):
             # If DNS resolution fails, treat it as an IP address directly
-            network = ipaddress.ip_network(config.duet_uri, strict=False).supernet(new_prefix=24)
+            network = ipaddress.ip_network(config.duet_uri, strict=False).supernet(
+                new_prefix=24,
+            )
         networks[f"{network}"] = config.duet_password
     return networks
 
@@ -61,17 +70,27 @@ def rescan_existing_networks(app):
 def run_app(autodiscover: AutoDiscover, app, profile, watchdog: Watchdog):
     """Run the application."""
     click.echo("Starting the Meltingplot Duet SimplyPrint.io Connector")
-    click.echo('Perform network scans for existing networks')
+    click.echo("Perform network scans for existing networks")
 
     networks = rescan_existing_networks(app)
 
     try:
         for network, pwd in networks.items():
             click.echo(f"Scanning existing network: {network} with password {pwd}")
-            if ':' in network:
-                autodiscover.autodiscover(password=pwd, ipv6_range=network, ipv4_range='127.0.0.1/32', timeout=5)
+            if ":" in network:
+                autodiscover.autodiscover(
+                    password=pwd,
+                    ipv6_range=network,
+                    ipv4_range="127.0.0.1/32",
+                    timeout=5,
+                )
             else:
-                autodiscover.autodiscover(password=pwd, ipv4_range=network, ipv6_range="::1/128", timeout=5)
+                autodiscover.autodiscover(
+                    password=pwd,
+                    ipv4_range=network,
+                    ipv6_range="::1/128",
+                    timeout=5,
+                )
     except Exception as e:
         click.echo(f"Error during network scan: {e}")
         logging.error(f"Error during network scan: {e}")
@@ -90,7 +109,7 @@ def run_app(autodiscover: AutoDiscover, app, profile, watchdog: Watchdog):
             click.echo("Exiting the Meltingplot Duet SimplyPrint.io Connector")
             pr.disable()
             s = io.StringIO()
-            sortby = 'cumulative'
+            sortby = "cumulative"
             ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
             ps.print_stats()
             click.echo(s.getvalue())

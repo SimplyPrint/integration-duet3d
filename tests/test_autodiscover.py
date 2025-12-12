@@ -5,6 +5,7 @@ from simplyprint_duet3d.duet.api import RepRapFirmware
 
 import simplyprint_duet3d.cli.autodiscover
 
+
 @pytest.mark.asyncio
 async def test_get_webcam_url_with_hostname():
     # Mock the RepRapFirmware instance
@@ -25,7 +26,7 @@ async def test_get_webcam_url_with_hostname():
     global download_dwc_file
     original_download_dwc_file = download_dwc_file
     simplyprint_duet3d.cli.autodiscover.download_dwc_file = mock_download_dwc_file
-    #download_dwc_file = mock_download_dwc_file
+    # download_dwc_file = mock_download_dwc_file
 
     try:
         # Call the function
@@ -37,6 +38,7 @@ async def test_get_webcam_url_with_hostname():
         # Restore the original function
         download_dwc_file = original_download_dwc_file
 
+
 @pytest.mark.asyncio
 async def test_get_webcam_url_with_ipv6():
     # Mock the RepRapFirmware instance
@@ -47,9 +49,7 @@ async def test_get_webcam_url_with_ipv6():
     async def mock_download_dwc_file(duet):
         return {
             "main": {
-                "webcam": {
-                    "url": "http://[::1]:8081/0/stream?timestamp=1234567890"
-                }
+                "webcam": {"url": "http://[::1]:8081/0/stream?timestamp=1234567890"}
             }
         }
 
@@ -57,7 +57,7 @@ async def test_get_webcam_url_with_ipv6():
     global download_dwc_file
     original_download_dwc_file = download_dwc_file
     simplyprint_duet3d.cli.autodiscover.download_dwc_file = mock_download_dwc_file
-    #download_dwc_file = mock_download_dwc_file
+    # download_dwc_file = mock_download_dwc_file
 
     try:
         # Call the function
@@ -68,6 +68,7 @@ async def test_get_webcam_url_with_ipv6():
     finally:
         # Restore the original function
         download_dwc_file = original_download_dwc_file
+
 
 @pytest.mark.asyncio
 async def test_get_webcam_url_with_ipv6_hostname():
@@ -89,7 +90,7 @@ async def test_get_webcam_url_with_ipv6_hostname():
     global download_dwc_file
     original_download_dwc_file = download_dwc_file
     simplyprint_duet3d.cli.autodiscover.download_dwc_file = mock_download_dwc_file
-    #download_dwc_file = mock_download_dwc_file
+    # download_dwc_file = mock_download_dwc_file
 
     try:
         # Call the function
@@ -122,7 +123,7 @@ async def test_get_webcam_url_with_hostname_and_params():
     global download_dwc_file
     original_download_dwc_file = download_dwc_file
     simplyprint_duet3d.cli.autodiscover.download_dwc_file = mock_download_dwc_file
-    #download_dwc_file = mock_download_dwc_file
+    # download_dwc_file = mock_download_dwc_file
 
     try:
         # Call the function
@@ -143,19 +144,13 @@ async def test_get_webcam_url_without_hostname():
 
     # Mock the download_dwc_file function
     async def mock_download_dwc_file(duet):
-        return {
-            "main": {
-                "webcam": {
-                    "url": "/webcam"
-                }
-            }
-        }
+        return {"main": {"webcam": {"url": "/webcam"}}}
 
     # Replace the actual download_dwc_file with the mock
     global download_dwc_file
     original_download_dwc_file = download_dwc_file
     simplyprint_duet3d.cli.autodiscover.download_dwc_file = mock_download_dwc_file
-    #download_dwc_file = mock_download_dwc_file
+    # download_dwc_file = mock_download_dwc_file
 
     try:
         # Call the function

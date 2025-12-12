@@ -34,7 +34,9 @@ def merge_dictionary(source, destination):
             if len(dest_value) == 0:
                 continue
             if len(value) > len(dest_value):
-                raise ValueError(f"List length mismatch in merge for key: {key} src: {value} dest: {dest_value}")
+                raise ValueError(
+                    f"List length mismatch in merge for key: {key} src: {value} dest: {dest_value}",
+                )
             for idx, item in enumerate(value):
                 if dest_value[idx] is not None and isinstance(item, dict):
                     result[key][idx] = merge_dictionary(item, dest_value[idx])
@@ -95,7 +97,7 @@ class DuetPrinterModel:
     def state(self) -> DuetState:
         """Get the state of the printer."""
         try:
-            return DuetState(self.om['state']['status'])
+            return DuetState(self.om["state"]["status"])
         except (KeyError, TypeError):
             return DuetState.disconnected
 
@@ -103,7 +105,7 @@ class DuetPrinterModel:
         """Track the state of the printer."""
         if old_om is None:
             return
-        old_state = DuetState(old_om['state']['status'])
+        old_state = DuetState(old_om["state"]["status"])
         if self.state != old_state:
             self.logger.debug(f"State change: {old_state} -> {self.state}")
             self.events.emit(DuetModelEvents.state, old_state)
@@ -111,10 +113,10 @@ class DuetPrinterModel:
     async def connect(self) -> None:
         """Connect the printer."""
         result = await self.api.connect()
-        if 'isEmulated' in result:
+        if "isEmulated" in result:
             self.sbc = True
         result = await self._fetch_full_status()
-        self.om = result['result']
+        self.om = result["result"]
         self.events.emit(DuetModelEvents.connect)
 
     async def close(self) -> None:
@@ -137,26 +139,26 @@ class DuetPrinterModel:
             no_reply=True,
         )
         if no_reply:
-            return ''
+            return ""
         return await self.reply()
 
     async def heightmap(self) -> dict:
         """Get the heightmap from the printer."""
-        compensation = self.om['move']['compensation']
+        compensation = self.om["move"]["compensation"]
         heightmap = io.BytesIO()
 
-        async for chunk in self.api.rr_download(filepath=compensation['file']):
+        async for chunk in self.api.rr_download(filepath=compensation["file"]):
             heightmap.write(chunk)
 
         heightmap.seek(0)
-        heightmap = heightmap.read().decode('utf-8')
+        heightmap = heightmap.read().decode("utf-8")
 
-        self.logger.debug('Mesh data: {!s}'.format(heightmap))
+        self.logger.debug("Mesh data: {!s}".format(heightmap))
 
-        mesh_data_csv = csv.reader(heightmap.splitlines()[3:], dialect='unix')
+        mesh_data_csv = csv.reader(heightmap.splitlines()[3:], dialect="unix")
 
         mesh_data = []
-        z_min, z_max = float('inf'), float('-inf')
+        z_min, z_max = float("inf"), float("-inf")
 
         for row in mesh_data_csv:
             x_line = [float(x.strip()) for x in row]
@@ -165,14 +167,14 @@ class DuetPrinterModel:
             mesh_data.append(x_line)
 
         return {
-            'type': 'rectangular' if compensation['liveGrid']['radius'] == -1 else 'circular',
-            'x_min': compensation['liveGrid']['mins'][0],
-            'x_max': compensation['liveGrid']['maxs'][0],
-            'y_min': compensation['liveGrid']['mins'][1],
-            'y_max': compensation['liveGrid']['maxs'][1],
-            'z_min': z_min,
-            'z_max': z_max,
-            'mesh_data': mesh_data,
+            "type": "rectangular" if compensation["liveGrid"]["radius"] == -1 else "circular",
+            "x_min": compensation["liveGrid"]["mins"][0],
+            "x_max": compensation["liveGrid"]["maxs"][0],
+            "y_min": compensation["liveGrid"]["mins"][1],
+            "y_max": compensation["liveGrid"]["maxs"][1],
+            "z_min": z_min,
+            "z_max": z_max,
+            "mesh_data": mesh_data,
         }
 
     async def reply(self) -> str:
@@ -183,7 +185,7 @@ class DuetPrinterModel:
     async def _fetch_objectmodel_recursive(
         self,
         *args,
-        key='',
+        key="",
         depth=1,
         frequently=False,
         include_null=True,
@@ -218,8 +220,8 @@ class DuetPrinterModel:
             **kwargs,
         )
 
-        if (depth == 1 or not self.sbc) and isinstance(response['result'], dict):
-            for k, v in response['result'].items():
+        if (depth == 1 or not self.sbc) and isinstance(response["result"], dict):
+            for k, v in response["result"].items():
                 sub_key = f"{key}.{k}" if key else k
                 sub_depth = depth + 1 if isinstance(v, dict) else 99
                 sub_response = await self._fetch_objectmodel_recursive(
@@ -231,8 +233,8 @@ class DuetPrinterModel:
                     verbose=verbose,
                     **kwargs,
                 )
-                response['result'][k] = sub_response['result']
-        elif 'next' in response and response['next'] > 0:
+                response["result"][k] = sub_response["result"]
+        elif "next" in response and response["next"] > 0:
             next_data = await self._fetch_objectmodel_recursive(
                 *args,
                 key=key,
@@ -240,18 +242,18 @@ class DuetPrinterModel:
                 frequently=frequently,
                 include_null=include_null,
                 verbose=verbose,
-                array=response['next'],
+                array=response["next"],
                 **kwargs,
             )
-            response['result'].extend(next_data['result'])
-            response['next'] = 0
+            response["result"].extend(next_data["result"])
+            response["next"] = 0
 
         return response
 
     async def _fetch_full_status(self) -> dict:
         try:
             response = await self._fetch_objectmodel_recursive(
-                key='',
+                key="",
                 depth=1,
                 frequently=False,
                 include_null=True,
@@ -264,15 +266,15 @@ class DuetPrinterModel:
 
     async def _handle_om_changes(self, changes: dict) -> None:
         """Handle object model changes."""
-        if 'reply' in changes:
+        if "reply" in changes:
             self._reply = await self.api.rr_reply()
             self._wait_for_reply.set()
             self.logger.debug(f"Reply: {self._reply}")
-            changes.pop('reply')
+            changes.pop("reply")
 
-        if 'volChanges' in changes:
+        if "volChanges" in changes:
             # TODO: handle volume changes
-            changes.pop('volChanges')
+            changes.pop("volChanges")
 
         for key in changes:
             changed_obj = await self._fetch_objectmodel_recursive(
@@ -282,7 +284,7 @@ class DuetPrinterModel:
                 include_null=True,
                 verbose=True,
             )
-            self.om[key] = changed_obj['result']
+            self.om[key] = changed_obj["result"]
 
     async def tick(self) -> None:
         """Tick the printer."""
@@ -297,26 +299,26 @@ class DuetPrinterModel:
     async def _initialize_object_model(self) -> None:
         """Initialize the object model by fetching the full status."""
         result = await self._fetch_full_status()
-        if result is None or 'result' not in result:
+        if result is None or "result" not in result:
             return
-        self.om = result['result']
+        self.om = result["result"]
         self.events.emit(DuetModelEvents.objectmodel, None)
 
     async def _update_object_model(self) -> None:
         """Update the object model by fetching partial updates."""
         result = await self.api.rr_model(
-            key='',
+            key="",
             depth=99,
             frequently=True,
             include_null=True,
             verbose=True,
         )
-        if result is None or 'result' not in result:
+        if result is None or "result" not in result:
             return
-        changes = self._detect_om_changes(result['result']['seqs'])
+        changes = self._detect_om_changes(result["result"]["seqs"])
         old_om = dict(self.om)
         try:
-            self.om = merge_dictionary(self.om, result['result'])
+            self.om = merge_dictionary(self.om, result["result"])
             if changes:
                 await self._handle_om_changes(changes)
             self.events.emit(DuetModelEvents.objectmodel, old_om)
@@ -344,7 +346,7 @@ class DuetPrinterModel:
         # there are no more than 10 clients connected to the duet board
         for _ in range(10):
             reply = await self.api.rr_reply(nocache=True)
-            if reply == '':
+            if reply == "":
                 break
             self._reply = reply
         self._wait_for_reply.set()

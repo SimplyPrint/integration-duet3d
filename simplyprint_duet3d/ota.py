@@ -1,9 +1,16 @@
 """Over-the-air update utilities."""
+import asyncio
+import logging
 import os
 import subprocess
 import sys
+import tempfile
 from importlib import metadata
 from typing import Optional
+
+import aiohttp
+
+from simplyprint_duet3d.gcode import GCodeCommand
 
 
 def in_virtual_env() -> bool:
@@ -57,7 +64,16 @@ def self_update(
     dist = _dist_for_import_name(import_name)
     requirement = dist + (version_spec or "")
 
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", requirement, "--upgrade-strategy", "only-if-needed"]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        requirement,
+        "--upgrade-strategy",
+        "only-if-needed",
+    ]
     if pre:
         cmd.append("--pre")
     if index_url:
@@ -75,5 +91,152 @@ def self_update(
     except FileNotFoundError:
         # Try bootstrapping pip, then retry once.
         import ensurepip
+
         ensurepip.bootstrap()
         return subprocess.call(cmd)
+
+
+# External (optional) components that can be updated via OTA.
+# Map of component name to shell command to install/update it.
+SUPPORTED_COMPONENTS = {
+    "ooo":
+    "https://download.simplyprint.io/ooo/install.sh",
+    "webcam":
+    ("https://raw.githubusercontent.com/SimplyPrint/"
+     "integration-duet3d/refs/heads/main/install-mjpeg-streamer.sh"),
+}
+
+
+async def _download_script(
+    logger: logging.Logger,
+    url: str,
+    script_path: str,
+) -> bool:
+    """Download a script from a URL and save it to the specified path."""
+    logger.info(f"Downloading installer from {url}...")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            if response.status != 200:
+                logger.error(
+                    f"Download failed with HTTP Status: {response.status}",
+                )
+                return False
+
+            content = await response.read()
+            with open(script_path, 'wb') as f:
+                f.write(content)
+
+    os.chmod(script_path, 0o700)
+    return True
+
+
+async def _execute_script(
+    logger: logging.Logger,
+    script_path: str,
+    component_name: str,
+) -> bool:
+    """Execute a script with sudo privileges and stream logs."""
+    logger.info("Executing installer with sudo privileges...")
+
+    process = await asyncio.create_subprocess_exec(
+        "sudo",
+        "bash",
+        script_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    async def log_stream_reader(stream):
+        while process.returncode is None:
+            line = await stream.readline()
+            if not line:
+                break
+            clean_line = line.decode('utf-8', errors='replace').strip()
+            if clean_line:
+                logger.info(f"[{component_name}] {clean_line}")
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(process.wait(), log_stream_reader(process.stdout)),
+            timeout=300,
+        )
+    except asyncio.TimeoutError:
+        logger.error("Update timed out after 300 seconds. Killing process.")
+        try:
+            process.kill()
+            await process.wait()
+        except ProcessLookupError:
+            pass
+        return False
+
+    if process.returncode == 0:
+        logger.info(f"Successfully updated {component_name}.")
+        return True
+
+    logger.error(
+        f"Update failed. Script exited with code {process.returncode}.",
+    )
+    return False
+
+
+async def update_external_component(
+    logger: logging.Logger,
+    component_name: str,
+) -> bool:
+    """
+    Asynchronously download a script and execute it via sudo.
+
+    Non-blocking network and process execution.
+    """
+    url = SUPPORTED_COMPONENTS.get(component_name)
+
+    if not url:
+        logger.error(
+            f"Component '{component_name}' not defined in SUPPORTED_COMPONENTS.",
+        )
+        return False
+
+    logger.info(f"Starting update process for component: {component_name}")
+
+    fd, script_path = tempfile.mkstemp(suffix=".sh")
+    os.close(fd)
+
+    try:
+        if not await _download_script(logger, url, script_path):
+            return False
+        return await _execute_script(logger, script_path, component_name)
+    except aiohttp.ClientError as e:
+        logger.error(f"Network error during download: {e}")
+        return False
+    except Exception as e:
+        logger.exception(
+            f"Unexpected error during update of {component_name}",
+            exc_info=e,
+        )
+        return False
+    finally:
+        if os.path.exists(script_path):
+            try:
+                os.remove(script_path)
+                logger.debug(f"Cleaned up temporary file: {script_path}")
+            except OSError as e:
+                logger.warning(f"Failed to remove temp file {script_path}: {e}")
+
+
+async def process_m997_command(
+    logger: logging.Logger,
+    command: GCodeCommand,
+) -> bool:
+    """Process an M997 GCode command for OTA component updates."""
+    s_param = next(filter(lambda p: p.startswith("S"), command.parameters), None)
+    if not s_param:
+        logger.error("M997 command missing S parameter.")
+        return False
+    component_name = s_param[1:]  # Remove 'S' prefix
+    component_name = component_name.strip('"').lower()
+
+    if component_name not in SUPPORTED_COMPONENTS:
+        logger.error(f"Component '{component_name}' is not supported for OTA updates.")
+        return False
+
+    return await update_external_component(logger, component_name)
