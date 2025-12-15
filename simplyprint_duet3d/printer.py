@@ -347,6 +347,7 @@ class DuetPrinter(
             "G29",
             "G90",
             "G91",
+            "M999",
         ]
 
         response = []
@@ -359,14 +360,14 @@ class DuetPrinter(
                     await self._notify_with_setup_code(),
                 )
             elif item.code == "M997":
-                await ota.process_m997_command(self.logger, item)
+                await ota.process_m997_command(self, item)
             else:
                 response.append("{!s} G-Code blocked".format(item.code))
                 # TODO: notify sentry
 
         self.logger.debug("Gcode response: {!s}".format("\n   [gcode] ".join(response)))
 
-    async def _perform_self_upgrade(self) -> None:
+    async def perform_self_upgrade(self) -> bool:
         """Perform self-upgrade and restart the API."""
         self.logger.info("Performing self upgrade")
 
@@ -378,7 +379,7 @@ class DuetPrinter(
         if ret == 0:
             self.logger.info("Plugin updated successfully, restarting API.")
             await self.on_api_restart()
-            return
+            return True
 
         await self.push_notification(
             severity=NotificationEventSeverity.WARNING,
@@ -387,6 +388,8 @@ class DuetPrinter(
                 message="An error occurred while updating the SimplyPrint Duet3D plugin. Please check the logs.",
             ),
         )
+
+        return False
 
     async def on_gcode(self, event: GcodeDemandData) -> None:
         """
@@ -839,4 +842,4 @@ class DuetPrinter(
             )
             return
 
-        await self._perform_self_upgrade()
+        await self.perform_self_upgrade()

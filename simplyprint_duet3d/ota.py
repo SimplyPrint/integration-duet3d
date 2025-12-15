@@ -6,11 +6,14 @@ import subprocess
 import sys
 import tempfile
 from importlib import metadata
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import aiohttp
 
 from simplyprint_duet3d.gcode import GCodeCommand
+
+if TYPE_CHECKING:
+    from simplyprint_duet3d.printer import DuetPrinter
 
 
 def in_virtual_env() -> bool:
@@ -224,19 +227,22 @@ async def update_external_component(
 
 
 async def process_m997_command(
-    logger: logging.Logger,
+    client: "DuetPrinter",
     command: GCodeCommand,
 ) -> bool:
     """Process an M997 GCode command for OTA component updates."""
     s_param = next(filter(lambda p: p.startswith("S"), command.parameters), None)
     if not s_param:
-        logger.error("M997 command missing S parameter.")
+        client.logger.error("M997 command missing S parameter.")
         return False
     component_name = s_param[1:]  # Remove 'S' prefix
     component_name = component_name.strip('"').lower()
 
+    if component_name == "self" or component_name == "simplyprint_duet3d":
+        return await client.perform_self_upgrade()
+
     if component_name not in SUPPORTED_COMPONENTS:
-        logger.error(f"Component '{component_name}' is not supported for OTA updates.")
+        client.logger.error(f"Component '{component_name}' is not supported for OTA updates.")
         return False
 
-    return await update_external_component(logger, component_name)
+    return await update_external_component(client.logger, component_name)
