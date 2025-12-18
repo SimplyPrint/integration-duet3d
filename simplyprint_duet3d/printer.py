@@ -326,44 +326,17 @@ class DuetPrinter(
         gcode = GCodeBlock().parse(event.list)
         self.logger.debug("Parsed Gcode: {!r}".format(gcode))
 
-        allowed_commands = [
-            "M17",
-            "M18",
-            "M104",
-            "M106",
-            "M107",
-            "M109",
-            "M112",
-            "M140",
-            "M190",
-            "M220",
-            "M221",
-            "M562",
-            "M701",
-            "M702",
-            "M290",
-            "G1",
-            "G28",
-            "G29",
-            "G90",
-            "G91",
-            "M999",
-        ]
-
         response = []
 
         for item in gcode.code:
-            if item.code in allowed_commands and not self.config.in_setup:
-                response.append(await self.duet.gcode(item.compress()))
-            elif item.code == "M300" and self.config.in_setup:
+            if item.code == "M300" and self.config.in_setup:
                 response.append(
                     await self._notify_with_setup_code(),
                 )
             elif item.code == "M997":
                 await ota.process_m997_command(self, item)
             else:
-                response.append("{!s} G-Code blocked".format(item.code))
-                # TODO: notify sentry
+                response.append(await self.duet.gcode(item.compress()))
 
         self.logger.debug("Gcode response: {!s}".format("\n   [gcode] ".join(response)))
 
@@ -392,11 +365,7 @@ class DuetPrinter(
         return False
 
     async def on_gcode(self, event: GcodeDemandData) -> None:
-        """
-        Receive GCode from SP and send GCode to duet.
-
-        The GCode is checked for allowed commands and then sent to the Duet.
-        """
+        """Receive GCode from SP and send GCode to duet."""
         await self.deferred_gcode(event)
 
     def _upload_file_progress(self, progress: float) -> None:
