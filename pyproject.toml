@@ -1,6 +1,6 @@
 [project]
 name = "simplyprint-duet3d"
-version = "1.3.16"
+version = "1.3.17"
 description = "SimplyPrint integration with any Duet3D powered RepRapFirmware printers "
 readme = "README.rst"
 license-files = ["LICENSE"]

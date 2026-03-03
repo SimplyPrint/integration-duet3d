@@ -702,8 +702,8 @@ class DuetPrinter(
 
     async def _update_times_left(self, times_left: dict) -> None:
         self.printer.job_info.time = (
-            times_left.get("filament") or times_left.get(
-                "slicer",
+            times_left.get("slicer") or times_left.get(
+                "filament",
             ) or times_left.get("file") or 0
         )
 
