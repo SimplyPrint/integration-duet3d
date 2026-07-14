@@ -59,7 +59,6 @@ from .state import map_duet_state_to_printer_status
 from .task import async_supress, async_task
 from .watchdog import Watchdog
 
-
 #: Seconds between object model polls unless configured per printer.
 DEFAULT_POLL_INTERVAL = 1.0
 
@@ -143,9 +142,7 @@ class DuetPrinter(
             float(self.config.duet_poll_interval or DEFAULT_POLL_INTERVAL),
         )
 
-        om_include = (
-            tuple(self.config.duet_om_include) if self.config.duet_om_include else DEFAULT_OM_INCLUDE_PATHS
-        )
+        om_include = (tuple(self.config.duet_om_include) if self.config.duet_om_include else DEFAULT_OM_INCLUDE_PATHS)
         om_frequent = (
             tuple(self.config.duet_om_frequent) if self.config.duet_om_frequent else DEFAULT_OM_FREQUENT_PATHS
         )

@@ -30,10 +30,7 @@ def _normalize_include(paths: Optional[Iterable[str]]) -> Optional[Tuple[str, ..
     ordered = tuple(dict.fromkeys(paths))
     if MATCH_ALL in ordered:
         return None
-    return tuple(
-        path for path in ordered
-        if not any(path != other and _is_under(path, other) for other in ordered)
-    )
+    return tuple(path for path in ordered if not any(path != other and _is_under(path, other) for other in ordered))
 
 
 @attr.s(frozen=True)
@@ -61,17 +58,14 @@ class ObjectModelFilter:
             return False
         if self.include is None:
             return True
-        return any(
-            _is_under(path, included) or _is_under(included, path)
-            for included in self.include
-        )
+        return any(_is_under(path, included) or _is_under(included, path) for included in self.include)
 
     def refetch_paths(self, key: str) -> Tuple[str, ...]:
         """Paths to refetch when the seq counter of a top-level key changes."""
         if self.is_excluded(key):
             return ()
         if self.include is None:
-            return (key,)
+            return (key, )
         return tuple(included for included in self.include if _is_under(included, key))
 
     def prune(self, tree: dict, path: str = "") -> dict:
