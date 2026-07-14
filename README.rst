@@ -70,9 +70,30 @@ The default password for the Duet is `reprap`, even if the web interface does no
             "duet_password": "reprap",
             "duet_unique_id": "YOUR_DUET_BOARD_ID",
             "duet_name": "YOUR_DUET_NAME",
-            "webcam_uri": "http://URI_OF_WEBCAM_SNAPSHOT_ENDPOINT/webcam"
+            "webcam_uri": "http://URI_OF_WEBCAM_SNAPSHOT_ENDPOINT/webcam",
+            "duet_om_include": null,
+            "duet_om_exclude": null,
+            "duet_om_frequent": null,
+            "duet_poll_interval": null
         }
     ]
+
+Object model polling options (all optional, ``null`` selects the built-in
+defaults):
+
+- ``duet_om_include``: list of object model paths (e.g. ``"heat"``,
+  ``"move.compensation"``) the connector is allowed to fetch. Anything outside
+  these subtrees is never requested from the printer, which keeps M409 /
+  ``rr_model`` traffic (and the DCS<->Duet SPI link in SBC mode) small. Use
+  ``["*"]`` to disable filtering and fetch the full object model. The paths
+  ``seqs`` and ``state.status`` are always fetched on top of a custom list.
+- ``duet_om_exclude``: list of paths that are never fetched, wins over
+  ``duet_om_include``.
+- ``duet_om_frequent``: subtrees polled with the M409 "frequently" flag on
+  every tick (default: ``heat``, ``job``, ``sensors.filamentMonitors``,
+  ``state``). Only paths allowed by the include/exclude filter are polled.
+- ``duet_poll_interval``: seconds between polls (default ``1.0``, minimum
+  ``0.1``). Raise this to further reduce load on the printer.
 
 
 -----------------------------------------------

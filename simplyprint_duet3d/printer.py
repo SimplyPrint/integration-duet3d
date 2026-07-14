@@ -11,7 +11,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Optional
+from typing import List, Optional
 
 import aiohttp
 
@@ -47,12 +47,24 @@ from yarl import URL
 
 from . import __version__, ota
 from .duet.api import RepRapFirmware
-from .duet.model import DuetPrinterModel
+from .duet.model import (
+    DEFAULT_OM_FREQUENT_PATHS,
+    DEFAULT_OM_INCLUDE_PATHS,
+    DuetPrinterModel,
+)
+from .duet.om_filter import ObjectModelFilter
 from .gcode import GCodeBlock
 from .network import get_local_ip_and_mac
 from .state import map_duet_state_to_printer_status
 from .task import async_supress, async_task
 from .watchdog import Watchdog
+
+
+#: Seconds between object model polls unless configured per printer.
+DEFAULT_POLL_INTERVAL = 1.0
+
+#: Lower bound protecting the printer from misconfigured poll intervals.
+MIN_POLL_INTERVAL = 0.1
 
 
 @dataclass
@@ -64,6 +76,15 @@ class DuetPrinterConfig(PrinterConfig):
     duet_password: Optional[str] = None
     duet_unique_id: Optional[str] = None
     webcam_uri: Optional[str] = None
+    #: Object model paths to fetch; None/empty means the built-in defaults,
+    #: ["*"] disables filtering and fetches the full object model.
+    duet_om_include: Optional[List[str]] = None
+    #: Object model paths to never fetch, wins over duet_om_include.
+    duet_om_exclude: Optional[List[str]] = None
+    #: Subtrees polled with the "frequently" flag on every tick.
+    duet_om_frequent: Optional[List[str]] = None
+    #: Seconds between object model polls.
+    duet_poll_interval: Optional[float] = None
 
 
 class DuetPrinter(
@@ -74,6 +95,7 @@ class DuetPrinter(
 
     duet: DuetPrinterModel
     watchdog: Watchdog
+    _poll_interval: float = DEFAULT_POLL_INTERVAL
 
     def __init__(self, *args, **kwargs) -> None:
         """Initialize the client."""
@@ -116,9 +138,27 @@ class DuetPrinter(
 
         self._printer_timeout = time.time() + 60 * 5  # 5 minutes
 
+        self._poll_interval = max(
+            MIN_POLL_INTERVAL,
+            float(self.config.duet_poll_interval or DEFAULT_POLL_INTERVAL),
+        )
+
+        om_include = (
+            tuple(self.config.duet_om_include) if self.config.duet_om_include else DEFAULT_OM_INCLUDE_PATHS
+        )
+        om_frequent = (
+            tuple(self.config.duet_om_frequent) if self.config.duet_om_frequent else DEFAULT_OM_FREQUENT_PATHS
+        )
+        om_filter = ObjectModelFilter(
+            include=om_include,
+            exclude=tuple(self.config.duet_om_exclude or ()),
+        )
+
         self.duet = DuetPrinterModel(
             logger=self.logger.getChild("duet"),
             api=duet_api,
+            om_filter=om_filter,
+            om_frequent_paths=om_frequent,
         )
 
         self.duet.events.on("connect", self._duet_on_connect)
@@ -238,7 +278,7 @@ class DuetPrinter(
                 await self._ensure_duet_connection()
                 await self.duet.tick()
                 self._printer_timeout = time.time() + 60 * 5
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(self._poll_interval)
             except TimeoutError:
                 continue
             except asyncio.CancelledError as e:

@@ -8,6 +8,7 @@ from enum import auto
 
 import aiohttp
 
+import attr
 from attr import define, field
 
 from pyee.asyncio import AsyncIOEventEmitter
@@ -15,6 +16,36 @@ from pyee.asyncio import AsyncIOEventEmitter
 from strenum import CamelCaseStrEnum, StrEnum
 
 from .api import RepRapFirmware
+from .om_filter import ObjectModelFilter
+
+#: Object model paths the connector reads. Anything outside these subtrees is
+#: never requested from the printer. Defaults match the Proteor machines.
+DEFAULT_OM_INCLUDE_PATHS = (
+    "boards",
+    "heat",
+    "job",
+    "move.compensation",
+    "network.name",
+    "sensors.filamentMonitors",
+    "state.status",
+    "tools",
+)
+
+#: Paths the model itself needs to operate; always added to a custom include.
+REQUIRED_OM_PATHS = (
+    "seqs",
+    "state.status",
+)
+
+#: Subtrees polled with the M409 "frequently" flag on every tick. Everything
+#: else only refreshes when its seq counter changes. Keep this to the live
+#: values the connector forwards (temperatures, job progress, runout, status).
+DEFAULT_OM_FREQUENT_PATHS = (
+    "heat",
+    "job",
+    "sensors.filamentMonitors",
+    "state",
+)
 
 
 def merge_dictionary(source, destination):
@@ -85,6 +116,11 @@ class DuetPrinterModel:
     logger = field(type=logging.Logger, factory=logging.getLogger)
     events = field(type=AsyncIOEventEmitter, factory=AsyncIOEventEmitter)
     sbc = field(type=bool, default=False)
+    om_filter = field(
+        type=ObjectModelFilter,
+        factory=lambda: ObjectModelFilter(include=DEFAULT_OM_INCLUDE_PATHS),
+    )
+    om_frequent_paths = field(type=tuple, default=DEFAULT_OM_FREQUENT_PATHS, converter=tuple)
     _reply = field(type=str, default=None)
     _wait_for_reply = field(type=asyncio.Event, factory=asyncio.Event)
 
@@ -92,6 +128,11 @@ class DuetPrinterModel:
         """Post init."""
         self.api.callbacks[503] = self._http_503_callback
         self.events.on(DuetModelEvents.objectmodel, self._track_state)
+        if self.om_filter.include is not None:
+            self.om_filter = attr.evolve(
+                self.om_filter,
+                include=self.om_filter.include + REQUIRED_OM_PATHS,
+            )
 
     @property
     def state(self) -> DuetState:
@@ -117,6 +158,7 @@ class DuetPrinterModel:
             self.sbc = True
         result = await self._fetch_full_status()
         self.om = result["result"]
+        self._seed_seqs()
         self.events.emit(DuetModelEvents.connect)
 
     async def close(self) -> None:
@@ -221,9 +263,18 @@ class DuetPrinterModel:
         )
 
         if (depth == 1 or not self.sbc) and isinstance(response["result"], dict) and key != "global":
-            for k, v in response["result"].items():
+            for k, v in list(response["result"].items()):
                 sub_key = f"{key}.{k}" if key else k
-                sub_depth = depth + 1 if isinstance(v, dict) else 99
+                if not self.om_filter.wanted(sub_key):
+                    del response["result"][k]
+                    continue
+                if isinstance(v, dict):
+                    sub_depth = depth + 1
+                elif isinstance(v, list):
+                    sub_depth = 99
+                else:
+                    # plain values are complete at any depth - no refetch needed
+                    continue
                 sub_response = await self._fetch_objectmodel_recursive(
                     *args,
                     key=sub_key,
@@ -233,7 +284,12 @@ class DuetPrinterModel:
                     verbose=verbose,
                     **kwargs,
                 )
-                response["result"][k] = sub_response["result"]
+                sub_result = sub_response["result"]
+                if isinstance(sub_result, dict):
+                    # SBC responses arrive as one deep subtree - prune what the
+                    # recursion could not filter per-request.
+                    sub_result = self.om_filter.prune(sub_result, sub_key)
+                response["result"][k] = sub_result
         elif "next" in response and response["next"] > 0:
             next_data = await self._fetch_objectmodel_recursive(
                 *args,
@@ -277,14 +333,39 @@ class DuetPrinterModel:
             changes.pop("volChanges")
 
         for key in changes:
-            changed_obj = await self._fetch_objectmodel_recursive(
-                key=key,
-                depth=2,
-                frequently=False,
-                include_null=True,
-                verbose=True,
-            )
-            self.om[key] = changed_obj["result"]
+            for path in self.om_filter.refetch_paths(key):
+                changed_obj = await self._fetch_objectmodel_recursive(
+                    key=path,
+                    depth=2,
+                    frequently=False,
+                    include_null=True,
+                    verbose=True,
+                )
+                value = changed_obj["result"]
+                if isinstance(value, dict):
+                    value = self.om_filter.prune(value, path)
+                self._set_om_value(path, value)
+
+    def _set_om_value(self, path: str, value) -> None:
+        """Set a value in the object model by dotted path, creating parent nodes."""
+        node = self.om
+        parts = path.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+
+    def _merge_om_value(self, path: str, value) -> None:
+        """Merge a partial subtree into the object model at a dotted path."""
+        wrapped = value
+        for part in reversed(path.split(".")):
+            wrapped = {part: wrapped}
+        self.om = merge_dictionary(self.om, wrapped)
+
+    def _seed_seqs(self) -> None:
+        """Seed the seq counters from a full fetch so the next poll only refetches real changes."""
+        seqs = self.om.get("seqs") if isinstance(self.om, dict) else None
+        if isinstance(seqs, dict):
+            self.seqs = dict(seqs)
 
     async def tick(self) -> None:
         """Tick the printer."""
@@ -302,10 +383,18 @@ class DuetPrinterModel:
         if result is None or "result" not in result:
             return
         self.om = result["result"]
+        self._seed_seqs()
         self.events.emit(DuetModelEvents.objectmodel, None)
 
     async def _update_object_model(self) -> None:
         """Update the object model by fetching partial updates."""
+        if self.om_filter.include is None:
+            await self._update_object_model_full()
+        else:
+            await self._update_object_model_narrow()
+
+    async def _update_object_model_full(self) -> None:
+        """Update the object model with a single whole-model "frequently" poll."""
         result = await self.api.rr_model(
             key="",
             depth=99,
@@ -325,6 +414,53 @@ class DuetPrinterModel:
         except (TypeError, KeyError, ValueError):
             self.logger.exception("Failed to update object model - fetch full model")
             self.logger.debug(f"Old OM: {old_om} result {result['result']}")
+            self.om = None
+            # TODO: send to sentry
+
+    async def _update_object_model_narrow(self) -> None:
+        """Update the object model by polling only the live subtrees.
+
+        A whole-model "frequently" poll makes the firmware serialize live
+        values of every top-level key (in SBC mode a multi-kilobyte
+        GetObjectModel transfer over SPI on every tick). Polling the seq
+        counters plus the few live subtrees the connector reads keeps each
+        transfer small.
+        """
+        seqs_response = await self.api.rr_model(
+            key="seqs",
+            depth=99,
+            frequently=False,
+            include_null=True,
+            verbose=True,
+        )
+        if seqs_response is None or not isinstance(seqs_response.get("result"), dict):
+            return
+        changes = self._detect_om_changes(seqs_response["result"])
+        old_om = dict(self.om)
+        try:
+            self._merge_om_value("seqs", seqs_response["result"])
+            for path in self.om_frequent_paths:
+                if not self.om_filter.wanted(path):
+                    continue
+                response = await self.api.rr_model(
+                    key=path,
+                    depth=99,
+                    frequently=True,
+                    include_null=True,
+                    verbose=True,
+                )
+                if response is None or "result" not in response:
+                    continue
+                value = response["result"]
+                if isinstance(value, dict):
+                    value = self.om_filter.prune(value, path)
+                self._merge_om_value(path, value)
+            if changes:
+                await self._handle_om_changes(changes)
+            self.events.emit(DuetModelEvents.objectmodel, old_om)
+        except (TypeError, KeyError, ValueError):
+            self.logger.exception("Failed to update object model - fetch full model")
+            self.logger.debug(f"Old OM: {old_om}")
             self.om = None
             # TODO: send to sentry
 
