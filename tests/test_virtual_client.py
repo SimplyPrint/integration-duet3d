@@ -29,6 +29,58 @@ def virtual_client():
         client = VirtualClient(config=config)
     return client
 
+async def _run_upload_with_status(virtual_client, status):
+    """Drive the upload retry loop with a failing status, return the duet mock."""
+    event = FileDemandData(name="demand", demand="file")
+    event.url = "http://example.com/file.gcode"
+    event.file_name = "file.gcode"
+    event.auto_start = False
+
+    mock_duet = AsyncMock()
+    mock_duet.upload_stream.side_effect = aiohttp.ClientResponseError(
+        request_info=Mock(),
+        history=(),
+        status=status,
+        message='Error',
+    )
+    virtual_client.duet = mock_duet
+    virtual_client.event_loop = asyncio.get_running_loop()
+    virtual_client._background_task = set()
+
+    async def _no_download(*args, **kwargs):
+        for chunk in (b'G28\n',):
+            yield chunk
+
+    with patch('meltingplot.duet_simplyprint_connector.virtual_client.FileDownload') as downloader, \
+            patch.object(virtual_client, '_fileprogress_task', AsyncMock()), \
+            patch('asyncio.sleep', new_callable=AsyncMock) as sleep:
+        downloader.return_value.download = _no_download
+        task = await virtual_client._download_file_from_sp_and_upload_to_duet(event)
+        await task
+
+    return mock_duet, sleep
+
+
+@pytest.mark.asyncio
+async def test_upload_retry_reconnects_only_on_401(virtual_client):
+    """401 means the Duet session is gone, so reauthenticating is correct."""
+    mock_duet, _ = await _run_upload_with_status(virtual_client, 401)
+
+    assert mock_duet.api.reconnect.await_count == VirtualClient.UPLOAD_MAX_RETRIES
+    assert virtual_client.printer.file_progress.state == FileProgressStateEnum.ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [500, 503])
+async def test_upload_retry_does_not_reconnect_on_busy(virtual_client, status):
+    """500/503 leave the session alive; reconnecting would claim a second slot."""
+    mock_duet, sleep = await _run_upload_with_status(virtual_client, status)
+
+    mock_duet.api.reconnect.assert_not_awaited()
+    sleep.assert_awaited_with(VirtualClient.UPLOAD_RETRY_DELAY)
+    assert virtual_client.printer.file_progress.state == FileProgressStateEnum.ERROR
+
+
 @pytest.mark.skip
 @pytest.mark.asyncio
 async def test_download_and_upload_file_progress_calculation(virtual_client):

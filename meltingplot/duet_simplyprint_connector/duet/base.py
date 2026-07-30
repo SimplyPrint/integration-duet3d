@@ -8,6 +8,7 @@ retry/reauthenticate decorator.
 
 import abc
 import asyncio
+import contextlib
 import functools
 import logging
 from typing import AsyncIterable, BinaryIO, Callable, Optional
@@ -41,6 +42,7 @@ def reauthenticate(retries: int = 3, auth_error_status: list[int] = None):
         @functools.wraps(f)
         async def inner(self, *args, **kwargs):
             remaining = retries
+            reauths = self.MAX_REAUTH_ATTEMPTS
             while remaining > 0:
                 try:
                     return await f(self, *args, **kwargs)
@@ -50,11 +52,12 @@ def reauthenticate(retries: int = 3, auth_error_status: list[int] = None):
                 except aiohttp.ClientResponseError as e:
                     remaining -= 1
                     self.logger.debug(f"Response error ({e.status}) while requesting {e.request_info!s}")
-                    remaining = await self._handle_response_error(
+                    remaining, reauths = await self._handle_response_error(
                         e,
                         remaining,
                         retries,
                         auth_error_status,
+                        reauths,
                     )
                 delay = min(self.BACKOFF_MULTIPLIER * (retries - remaining + 1), self.RETRY_DELAY_MAX)
                 await asyncio.sleep(delay)
@@ -80,6 +83,17 @@ class DuetAPIBase(abc.ABC):
     DEFAULT_DOWNLOAD_CHUNK_SIZE = 1024  # bytes
     DEFAULT_AUTH_ERROR_STATUS = [401]
 
+    # A Duet 2 WiFi processes only 3 HTTP requests at a time (NumHttpResponders)
+    # and its ESP8266 offers 8 TCP sockets in total, shared with every other
+    # client. Serialize our own short requests so we never claim more than one
+    # slot, and cap the connection pool at one extra slot for a running stream.
+    MAX_CONCURRENT_REQUESTS = 1
+    MAX_CONNECTIONS = 2
+
+    # Upper bound on re-authentications within a single retried request, so a
+    # board that keeps answering 401 cannot turn into an endless rr_connect loop.
+    MAX_REAUTH_ATTEMPTS = 3
+
     address = attr.ib(type=str, default="http://10.42.0.2")
     password = attr.ib(type=str, default="reprap")
     session_timeout = attr.ib(type=int, default=DEFAULT_SESSION_TIMEOUT)
@@ -89,6 +103,11 @@ class DuetAPIBase(abc.ABC):
     logger = attr.ib(type=logging.Logger, factory=logging.getLogger)
     callbacks = attr.ib(type=dict, factory=dict)
     _reconnect_lock = attr.ib(type=asyncio.Lock, factory=asyncio.Lock)
+    _request_semaphore = attr.ib(
+        type=asyncio.Semaphore,
+        factory=lambda: asyncio.Semaphore(DuetAPIBase.MAX_CONCURRENT_REQUESTS),
+    )
+    _http_busy_streak = attr.ib(type=int, default=0)
 
     @address.validator
     def _validate_address(self, attribute, value):
@@ -110,22 +129,50 @@ class DuetAPIBase(abc.ABC):
             await self.session.close()
             self.session = None
 
+    @contextlib.asynccontextmanager
+    async def _request(self, method: str, url: str, **kwargs):
+        """Issue an HTTP request while holding the concurrency semaphore.
+
+        The semaphore is released as soon as the caller leaves the context, so
+        a retry backoff never keeps the slot occupied. Streaming transfers
+        deliberately bypass this helper; they are bounded by the connection
+        pool instead, otherwise a long upload would stall the polling loop.
+
+        :param method: HTTP method, 'get' or 'post'
+        :param url: Request URL
+        :param kwargs: Passed through to the aiohttp session method
+        """
+        async with self._request_semaphore:
+            async with getattr(self.session, method.lower())(url, **kwargs) as response:
+                yield response
+                # Reached only when the caller left the block without error,
+                # so the board is answering again and any busy streak is over.
+                self._http_busy_streak = 0
+
     async def _handle_response_error(
         self,
         error,
         remaining,
         retries,
         auth_error_status,
+        reauths,
     ):
         """Handle an HTTP response error during a retried request.
 
-        Returns the updated remaining retry count.
+        Returns the updated (remaining retry count, remaining reauth count).
         Raises the error if it is not retriable.
         """
         if error.status in self.callbacks:
             await self.callbacks[error.status](error)
-            return remaining
+            return remaining, reauths
         if error.status not in auth_error_status:
+            raise error
+        if reauths <= 0:
+            self.logger.error(
+                f'Auth error ({error.status}) while requesting'
+                f' {error.request_info!s} - giving up after'
+                f' {self.MAX_REAUTH_ATTEMPTS} reauthentications',
+            )
             raise error
         self.logger.error(
             f'Auth error ({error.status}) while requesting'
@@ -133,10 +180,10 @@ class DuetAPIBase(abc.ABC):
         )
         try:
             await self.reconnect()
-            return retries
+            return retries, reauths - 1
         except _TRANSIENT_ERRORS as e:
             self.logger.error(f"Reconnect failed: {e}")
-            return remaining
+            return remaining, reauths - 1
 
     async def _ensure_session(self) -> None:
         """Ensure a valid session."""

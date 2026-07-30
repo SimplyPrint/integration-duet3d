@@ -105,6 +105,10 @@ class VirtualClient(DefaultClient[VirtualConfig], ClientCameraMixin[VirtualConfi
     FILE_PROGRESS_UPDATE_INTERVAL = 5  # seconds
     UPLOAD_MAX_RETRIES = 3
     UPLOAD_RETRY_STATUSES = {401, 500, 503}
+    # Only 401 means the Duet session is gone. Reconnecting on 500/503 would
+    # claim a second of the board's eight session slots next to a live one.
+    UPLOAD_REAUTH_STATUSES = {401}
+    UPLOAD_RETRY_DELAY = 5  # seconds
 
     # Temperatures
     DEFAULT_AMBIENT_TEMPERATURE = 20  # Celsius
@@ -495,6 +499,19 @@ class VirtualClient(DefaultClient[VirtualConfig], ClientCameraMixin[VirtualConfi
             self.printer.file_progress.model_set_changed("state", "percent")
             await asyncio.sleep(self.FILE_PROGRESS_UPDATE_INTERVAL)
 
+    async def _recover_from_upload_error(
+        self,
+        error: aiohttp.ClientResponseError,
+    ) -> None:
+        """Prepare for another upload attempt after a retriable error."""
+        if error.status in self.UPLOAD_REAUTH_STATUSES:
+            # The Duet session is gone, so a new one costs us nothing.
+            await self.duet.api.reconnect()
+        else:
+            # The session is still alive and the board is merely busy.
+            # Reconnecting here would occupy a second of its eight slots.
+            await asyncio.sleep(self.UPLOAD_RETRY_DELAY)
+
     @async_task
     @async_supress
     async def _download_file_from_sp_and_upload_to_duet(
@@ -544,7 +561,7 @@ class VirtualClient(DefaultClient[VirtualConfig], ClientCameraMixin[VirtualConfi
                             self.UPLOAD_MAX_RETRIES,
                         )
                         f.seek(0)
-                        await self.duet.api.reconnect()
+                        await self._recover_from_upload_error(e)
                     else:
                         self.logger.exception(
                             "An exception occurred while uploading file to Duet",
