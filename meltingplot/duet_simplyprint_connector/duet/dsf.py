@@ -60,12 +60,12 @@ class DuetSoftwareFramework(DuetAPIBase):
     async def reconnect(self) -> dict:
         """Reconnect to the Duet via DSF."""
         # Prevent multiple reconnects
-        if self._reconnect_lock.locked():
+        if self.reconnect_lock.locked():
             # Wait for reconnect to finish
-            async with self._reconnect_lock:
+            async with self.reconnect_lock:
                 return {'sessionKey': self.session.headers.get('X-Session-Key', '')}
 
-        async with self._reconnect_lock:
+        async with self.reconnect_lock:
             url = f'{self.address}/machine/connect'
 
             params = {

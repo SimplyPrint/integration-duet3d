@@ -102,11 +102,8 @@ class DuetAPIBase(abc.ABC):
     session = attr.ib(type=aiohttp.ClientSession, default=None)
     logger = attr.ib(type=logging.Logger, factory=logging.getLogger)
     callbacks = attr.ib(type=dict, factory=dict)
-    _reconnect_lock = attr.ib(type=asyncio.Lock, factory=asyncio.Lock)
-    _request_semaphore = attr.ib(
-        type=asyncio.Semaphore,
-        factory=lambda: asyncio.Semaphore(DuetAPIBase.MAX_CONCURRENT_REQUESTS),
-    )
+    _reconnect_lock = attr.ib(type=Optional[asyncio.Lock], default=None)
+    _request_semaphore = attr.ib(type=Optional[asyncio.Semaphore], default=None)
     _http_busy_streak = attr.ib(type=int, default=0)
 
     @address.validator
@@ -114,6 +111,24 @@ class DuetAPIBase(abc.ABC):
         valid_schemes = ('http://', 'https://', 'file://')
         if not any(value.startswith(s) for s in valid_schemes):
             raise ValueError('Address must start with http://, https://, or file://')
+
+    # On Python 3.9 asyncio primitives bind to the event loop that is current
+    # when they are constructed. These objects are built outside the loop, so
+    # both primitives are created on first use instead, from inside it.
+
+    @property
+    def reconnect_lock(self) -> asyncio.Lock:
+        """Return the reconnect lock, bound to the running loop on first use."""
+        if self._reconnect_lock is None:
+            self._reconnect_lock = asyncio.Lock()
+        return self._reconnect_lock
+
+    @property
+    def request_semaphore(self) -> asyncio.Semaphore:
+        """Return the request semaphore, bound to the running loop on first use."""
+        if self._request_semaphore is None:
+            self._request_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_REQUESTS)
+        return self._request_semaphore
 
     async def connect(self) -> dict:
         """Connect to the Duet."""
@@ -142,7 +157,7 @@ class DuetAPIBase(abc.ABC):
         :param url: Request URL
         :param kwargs: Passed through to the aiohttp session method
         """
-        async with self._request_semaphore:
+        async with self.request_semaphore:
             async with getattr(self.session, method.lower())(url, **kwargs) as response:
                 yield response
                 # Reached only when the caller left the block without error,

@@ -252,11 +252,11 @@ class DuetControlSocket(DuetAPIBase):
 
     async def reconnect(self) -> dict:
         """Reconnect to DCS via Unix socket."""
-        if self._reconnect_lock.locked():
-            async with self._reconnect_lock:
+        if self.reconnect_lock.locked():
+            async with self.reconnect_lock:
                 return {'isEmulated': True}
 
-        async with self._reconnect_lock:
+        async with self.reconnect_lock:
             await self._close_command_connection()
             await self._init_command_connection()
             return {'isEmulated': True}
