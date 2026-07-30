@@ -258,20 +258,146 @@ async def test_reconnect_raises_on_auth_failure(mock_session):
         await rrf.reconnect()
 
 
-@pytest.mark.asyncio
-async def test_http_503_drains_reply_buffer(reprapfirmware):
-    """Verify RRF 503 callback calls rr_reply to drain output buffers."""
-    error = aiohttp.ClientResponseError(
+def _response_error(status):
+    return aiohttp.ClientResponseError(
         request_info=MagicMock(),
         history=(),
-        status=503,
-        message='Service Unavailable',
+        status=status,
+        message='Error',
     )
 
-    reprapfirmware.rr_reply = AsyncMock(return_value='M122 diagnostic output')
+
+@pytest.mark.asyncio
+async def test_http_503_drains_reply_buffer(reprapfirmware):
+    """Verify RRF 503 callback drains the reply buffer exactly once."""
+    reprapfirmware._fetch_reply = AsyncMock(return_value='M122 diagnostic output')
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr('asyncio.sleep', AsyncMock())
-        await reprapfirmware._default_http_503_busy_callback(error)
+        await reprapfirmware._default_http_503_busy_callback(_response_error(503))
 
-    reprapfirmware.rr_reply.assert_awaited_once_with(nocache=True)
+    # A single, undecorated request: no retry loop nested inside the retry loop
+    # that is already running around the failed request.
+    reprapfirmware._fetch_reply.assert_awaited_once_with()
+    assert reprapfirmware._last_reply == 'M122 diagnostic output'
+
+
+@pytest.mark.asyncio
+async def test_http_503_drain_failure_is_swallowed(reprapfirmware):
+    """A 503 while draining must not escape the callback."""
+    reprapfirmware._fetch_reply = AsyncMock(side_effect=_response_error(503))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr('asyncio.sleep', AsyncMock())
+        await reprapfirmware._default_http_503_busy_callback(_response_error(503))
+
+    reprapfirmware._fetch_reply.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_503_retry_drains_without_deadlock(reprapfirmware, mock_session):
+    """A real 503 must drain and retry without blocking on its own semaphore."""
+    attempts = 0
+    real_aenter = mock_session.get.return_value.__aenter__
+
+    async def failing_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _response_error(503)
+        return await real_aenter(*args, **kwargs)
+
+    mock_session.get.return_value.__aenter__ = failing_once
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr('asyncio.sleep', AsyncMock())
+        response = await asyncio.wait_for(reprapfirmware.rr_model(key='state'), timeout=5)
+
+    assert response == {'err': 0}
+    # first attempt (503) -> drain via rr_reply -> successful retry
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_busy_backoff_grows_and_resets(reprapfirmware, mock_session):
+    """Busy backoff escalates while the board stays busy and resets on success."""
+    delays = [reprapfirmware._busy_backoff_delay() for _ in range(6)]
+
+    assert delays == [5, 10, 20, 30, 30, 30]
+
+    await reprapfirmware.rr_model(key='state')
+
+    assert reprapfirmware._busy_backoff_delay() == 5
+
+
+@pytest.mark.asyncio
+async def test_requests_are_serialized(reprapfirmware, mock_session):
+    """Only one non-streaming request may be in flight against the board."""
+    in_flight = 0
+    peak = 0
+
+    original_aenter = mock_session.get.return_value.__aenter__
+
+    async def tracked_aenter(*args, **kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        result = await original_aenter(*args, **kwargs)
+        in_flight -= 1
+        return result
+
+    mock_session.get.return_value.__aenter__ = tracked_aenter
+
+    await asyncio.gather(*(reprapfirmware.rr_model(key=f'k{i}') for i in range(5)))
+
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_close_releases_duet_session(reprapfirmware, mock_session):
+    """close() hands the board's session slot back via rr_disconnect."""
+    await reprapfirmware.reconnect()
+    mock_session.headers = {'X-Session-Key': '4711'}
+    mock_session.get.reset_mock()
+
+    await reprapfirmware.close()
+
+    assert mock_session.get.call_args[0][0] == 'http://10.42.0.2/rr_disconnect'
+    mock_session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_without_session_key_skips_disconnect(reprapfirmware, mock_session):
+    """Without a session key there is nothing to release."""
+    mock_session.headers = {}
+
+    await reprapfirmware.close()
+
+    mock_session.get.assert_not_called()
+    mock_session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_survives_failing_disconnect(reprapfirmware, mock_session):
+    """A failing rr_disconnect must not prevent the session teardown."""
+    mock_session.headers = {'X-Session-Key': '4711'}
+    mock_session.get.side_effect = aiohttp.ClientConnectionError('boom')
+
+    await reprapfirmware.close()
+
+    mock_session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_releases_previous_session(reprapfirmware, mock_session):
+    """A reconnect on a live session frees the old slot before taking a new one."""
+    mock_session.headers = {'X-Session-Key': '4711'}
+
+    await reprapfirmware.reconnect()
+
+    called = [call[0][0] for call in mock_session.get.call_args_list]
+    assert called == [
+        'http://10.42.0.2/rr_disconnect',
+        'http://10.42.0.2/rr_connect',
+    ]

@@ -26,6 +26,10 @@ class RepRapFirmware(DuetAPIBase):
 
     # Delay before retrying after HTTP errors (seconds)
     HTTP_ERROR_RETRY_DELAY = 5
+    HTTP_ERROR_RETRY_DELAY_MAX = 30
+
+    # Timeout for the best-effort rr_disconnect when tearing a session down
+    DISCONNECT_TIMEOUT = 3
 
     # Default model query depth
     DEFAULT_MODEL_DEPTH = 99
@@ -45,35 +49,49 @@ class RepRapFirmware(DuetAPIBase):
         self.callbacks[self.HTTP_BAD_GATEWAY] = self._default_http_502_bad_gateway_callback
         self.callbacks[self.HTTP_SERVICE_UNAVAILABLE] = self._default_http_503_busy_callback
 
+    def _busy_backoff_delay(self) -> float:
+        """Return the next backoff delay and advance the busy streak.
+
+        The streak is reset by :meth:`_request` on the first successful
+        response, so a board that recovers is polled again straight away.
+        """
+        delay = min(
+            self.HTTP_ERROR_RETRY_DELAY * (2**self._http_busy_streak),
+            self.HTTP_ERROR_RETRY_DELAY_MAX,
+        )
+        self._http_busy_streak += 1
+        return delay
+
     async def _default_http_502_bad_gateway_callback(self, e):
         # a reverse proxy may return HTTP status code 502 if the Duet is not available
         # due to open socket limit. In this case, we retry the request.
         self.logger.error(f'Duet bad gateway {e.request_info!s} - retry')
-        await asyncio.sleep(self.HTTP_ERROR_RETRY_DELAY)
+        await asyncio.sleep(self._busy_backoff_delay())
 
     async def _default_http_503_busy_callback(self, e):
-        # RepRapFirmware may run short on output buffers when a large
-        # gcode reply (e.g. M122) is pending, preventing it from
-        # assembling rr_model responses. Drain the reply buffer first.
+        # RepRapFirmware pins a gcode reply until as many clients have fetched
+        # it as there are open HTTP sessions; until then those output buffers
+        # are unavailable for assembling rr_model responses and we get a 503.
+        # Fetch our share of the reply so the board can release the buffers.
         self.logger.error(f'Duet busy {e.request_info!s} - retry')
         self.logger.debug(f"Received HTTP 503 for {e.request_info!s}")
         try:
-            reply = await self.rr_reply(nocache=True)
+            reply = self._cache_reply(await self._fetch_reply(), nocache=True)
             if reply:
                 self.logger.debug(f"Drained pending reply: {reply[:200]}")
         except Exception as drain_err:
             self.logger.debug(f"Failed to drain reply buffer: {drain_err}")
-        await asyncio.sleep(self.HTTP_ERROR_RETRY_DELAY)
+        await asyncio.sleep(self._busy_backoff_delay())
 
     async def reconnect(self) -> dict:
         """Reconnect to the Duet."""
         # Prevent multiple reconnects
-        if self._reconnect_lock.locked():
+        if self.reconnect_lock.locked():
             # Wait for reconnect to finish
-            async with self._reconnect_lock:
+            async with self.reconnect_lock:
                 return {'err': 0}
 
-        async with self._reconnect_lock:
+        async with self.reconnect_lock:
             url = f'{self.address}/rr_connect'
 
             params = {
@@ -82,17 +100,29 @@ class RepRapFirmware(DuetAPIBase):
             }
 
             if self.session is None or self.session.closed:
-                connector = aiohttp.TCPConnector(force_close=True)
+                # force_close because RepRapFirmware answers every rr_* request
+                # with 'Connection: close'; a pooled socket would only yield
+                # ServerDisconnectedError. The limits keep us to one slot for
+                # regular requests plus one for a concurrent stream.
+                connector = aiohttp.TCPConnector(
+                    force_close=True,
+                    limit=self.MAX_CONNECTIONS,
+                    limit_per_host=self.MAX_CONNECTIONS,
+                )
                 self.session = aiohttp.ClientSession(
                     connector=connector,
                     timeout=aiohttp.ClientTimeout(total=self.http_timeout),
                     raise_for_status=True,
                 )
             else:
+                # Hand the previous session slot back before asking for a new
+                # one. rr_connect with sessionKey=yes allocates unconditionally,
+                # and the board only has eight slots for every client together.
+                await self._release_session()
                 self.session.headers.clear()
 
             json_response = {}
-            async with self.session.get(url, params=params) as r:
+            async with self._request('get', url, params=params) as r:
                 json_response = await r.json()
 
             if json_response.get('err', 0) != 0:
@@ -122,10 +152,38 @@ class RepRapFirmware(DuetAPIBase):
         url = f'{self.address}/rr_disconnect'
 
         response = {}
-        async with self.session.get(url) as r:
+        async with self._request('get', url) as r:
             response = await r.json()
-        await self.close()
+        await super().close()
         return response
+
+    async def _release_session(self) -> None:
+        """Best-effort rr_disconnect to free the board's session slot.
+
+        RepRapFirmware keeps a session for HttpSessionTimeout (8s) after the
+        last request, and pins pending gcode replies until every open session
+        has fetched them. Giving the slot back explicitly avoids both.
+        """
+        if self.session is None or self.session.closed:
+            return
+        if 'X-Session-Key' not in self.session.headers:
+            return
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=self.DISCONNECT_TIMEOUT)
+            async with self._request('get', f'{self.address}/rr_disconnect', timeout=timeout) as r:
+                await r.read()
+        except asyncio.CancelledError:
+            # Swallowed on purpose: this runs from close(), and the caller still
+            # needs the aiohttp session torn down. The board times the slot out.
+            self.logger.debug('Cancelled while releasing the Duet session')
+        except Exception as e:
+            self.logger.debug(f"rr_disconnect failed, letting the session time out: {e}")
+
+    async def close(self) -> None:
+        """Release the Duet session, then close the Client Session."""
+        await self._release_session()
+        await super().close()
 
     @reauthenticate()
     async def rr_model(
@@ -174,7 +232,7 @@ class RepRapFirmware(DuetAPIBase):
         }
 
         response = {}
-        async with self.session.get(url, params=params) as r:
+        async with self._request('get', url, params=params) as r:
             response = await r.json()
         return response
 
@@ -189,7 +247,7 @@ class RepRapFirmware(DuetAPIBase):
             'gcode': gcode,
         }
 
-        async with self.session.get(url, params=params) as r:
+        async with self._request('get', url, params=params) as r:
             await r.read()  # Consume response to release connection
 
         if no_reply:
@@ -197,21 +255,22 @@ class RepRapFirmware(DuetAPIBase):
         else:
             return await self.rr_reply()
 
-    @reauthenticate()
-    async def rr_reply(self, nocache: bool = False) -> str:
-        """rr_reply Get Reply from Duet.
+    async def _fetch_reply(self) -> str:
+        """Fetch the pending reply without any retry handling.
 
-        Returns the cached reply if caching is enabled, response is empty,
-        and the cache hasn't expired. Otherwise fetches and caches new response.
+        Kept separate from :meth:`rr_reply` so the HTTP 503 callback can drain
+        the board's reply buffer with a single request instead of nesting a
+        second retry loop inside the one that is already running.
         """
         await self._ensure_session()
 
         url = f'{self.address}/rr_reply'
 
-        response = ''
-        async with self.session.get(url) as r:
-            response = await r.text()
+        async with self._request('get', url) as r:
+            return await r.text()
 
+    def _cache_reply(self, response: str, nocache: bool) -> str:
+        """Apply the reply cache policy and return the effective reply."""
         now = datetime.datetime.now()
 
         # Return cached reply if: caching enabled, empty response, cache still valid
@@ -224,6 +283,15 @@ class RepRapFirmware(DuetAPIBase):
             self._last_reply_timeout = now + datetime.timedelta(seconds=self.REPLY_CACHE_TTL)
 
         return response
+
+    @reauthenticate()
+    async def rr_reply(self, nocache: bool = False) -> str:
+        """rr_reply Get Reply from Duet.
+
+        Returns the cached reply if caching is enabled, response is empty,
+        and the cache hasn't expired. Otherwise fetches and caches new response.
+        """
+        return self._cache_reply(await self._fetch_reply(), nocache)
 
     async def rr_download(
         self,
@@ -239,6 +307,8 @@ class RepRapFirmware(DuetAPIBase):
             'name': filepath,
         }
 
+        # Like rr_upload_stream, streaming downloads bypass the request
+        # semaphore so a slow transfer cannot block the polling loop.
         async with self.session.get(url, params=params) as r:
             async for chunk in r.content.iter_chunked(chunk_size):
                 yield chunk
@@ -275,7 +345,7 @@ class RepRapFirmware(DuetAPIBase):
         }
 
         response = b''
-        async with self.session.post(url, data=content, params=params, headers=headers) as r:
+        async with self._request('post', url, data=content, params=params, headers=headers) as r:
             response = await r.json()
         return response
 
@@ -327,6 +397,11 @@ class RepRapFirmware(DuetAPIBase):
             'Content-Length': str(filesize),
         }
 
+        # Deliberately not routed through _request(): a multi-minute upload must
+        # not hold the request semaphore, or the polling loop would stall long
+        # enough for _printer_timeout to mark the printer offline and close the
+        # session underneath this very transfer. The connection pool caps us at
+        # MAX_CONNECTIONS instead.
         response = b''
         async with self.session.post(
             url=url,
@@ -362,7 +437,7 @@ class RepRapFirmware(DuetAPIBase):
         }
 
         response = {}
-        async with self.session.get(url, params=params, **kwargs) as r:
+        async with self._request('get', url, params=params, **kwargs) as r:
             response = await r.json()
 
         return response
@@ -391,7 +466,7 @@ class RepRapFirmware(DuetAPIBase):
             params['name'] = name
 
         response = {}
-        async with self.session.get(url, params=params, **kwargs) as r:
+        async with self._request('get', url, params=params, **kwargs) as r:
             response = await r.json()
 
         return response
@@ -416,7 +491,7 @@ class RepRapFirmware(DuetAPIBase):
         }
 
         response = {}
-        async with self.session.get(url, params=params) as r:
+        async with self._request('get', url, params=params) as r:
             response = await r.json()
 
         return response
@@ -452,7 +527,7 @@ class RepRapFirmware(DuetAPIBase):
         }
 
         response = {}
-        async with self.session.get(url, params=params) as r:
+        async with self._request('get', url, params=params) as r:
             response = await r.json()
 
         return response
@@ -477,7 +552,7 @@ class RepRapFirmware(DuetAPIBase):
         }
 
         response = {}
-        async with self.session.get(url, params=params) as r:
+        async with self._request('get', url, params=params) as r:
             response = await r.json()
 
         return response

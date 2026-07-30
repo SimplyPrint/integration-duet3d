@@ -157,6 +157,33 @@ async def test_reauthenticate_auth_error_reconnects(api):
 
 
 @pytest.mark.asyncio
+async def test_reauthenticate_stops_after_max_reauth_attempts(api):
+    """A board answering 401 forever must not loop reconnecting indefinitely."""
+    call_count = 0
+    api.reconnect = AsyncMock()
+
+    @reauthenticate(retries=3, auth_error_status=[401])
+    async def method(self):
+        nonlocal call_count
+        call_count += 1
+        raise aiohttp.ClientResponseError(
+            request_info=MagicMock(),
+            history=(),
+            status=401,
+            message='Unauthorized',
+        )
+
+    with patch('asyncio.sleep', new_callable=AsyncMock):
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await method(api)
+
+    assert exc_info.value.status == 401
+    assert api.reconnect.await_count == DuetAPIBase.MAX_REAUTH_ATTEMPTS
+    # Without the cap the budget reset would keep this running forever.
+    assert call_count == DuetAPIBase.MAX_REAUTH_ATTEMPTS + 1
+
+
+@pytest.mark.asyncio
 async def test_reauthenticate_callback_status(api):
     """Test that a registered callback status invokes the callback."""
     callback = AsyncMock()
