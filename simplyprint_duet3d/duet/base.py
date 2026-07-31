@@ -1,0 +1,293 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+"""Duet API Base Module.
+
+Provides the abstract base class for Duet API backends and a unified
+retry/reauthenticate decorator.
+"""
+
+import abc
+import asyncio
+import contextlib
+import functools
+import logging
+from typing import AsyncIterable, BinaryIO, Callable, Optional
+
+import aiohttp
+import attr
+
+_TRANSIENT_ERRORS = (
+    TimeoutError,
+    asyncio.TimeoutError,
+    aiohttp.ClientPayloadError,
+    aiohttp.ClientConnectionError,
+)
+
+
+def reauthenticate(retries: int = 3, auth_error_status: list[int] = None):
+    """Reauthenticate API requests.
+
+    Decorator that wraps async API methods with retry logic for handling
+    connection errors and authentication failures. Uses linear backoff
+    capped at RETRY_DELAY_MAX seconds.
+
+    :param retries: Number of retries before giving up
+    :param auth_error_status: HTTP status code indicating auth failure
+                              (401 for RRF, 403 for DSF)
+    """
+    auth_error_status = auth_error_status or DuetAPIBase.DEFAULT_AUTH_ERROR_STATUS
+
+    def decorator(f):
+
+        @functools.wraps(f)
+        async def inner(self, *args, **kwargs):
+            remaining = retries
+            reauths = self.MAX_REAUTH_ATTEMPTS
+            while remaining > 0:
+                try:
+                    return await f(self, *args, **kwargs)
+                except _TRANSIENT_ERRORS as e:
+                    remaining -= 1
+                    self.logger.error(f"{e} - retry")
+                except aiohttp.ClientResponseError as e:
+                    remaining -= 1
+                    self.logger.debug(f"Response error ({e.status}) while requesting {e.request_info!s}")
+                    remaining, reauths = await self._handle_response_error(
+                        e,
+                        remaining,
+                        retries,
+                        auth_error_status,
+                        reauths,
+                    )
+                delay = min(self.BACKOFF_MULTIPLIER * (retries - remaining + 1), self.RETRY_DELAY_MAX)
+                await asyncio.sleep(delay)
+            raise TimeoutError(f'Retried {retries} times to reauthenticate.')
+
+        return inner
+
+    return decorator
+
+
+@attr.s
+class DuetAPIBase(abc.ABC):
+    """Abstract base class for Duet API backends."""
+
+    # Class constants
+    DEFAULT_SESSION_TIMEOUT = 8000  # milliseconds
+    DEFAULT_HTTP_TIMEOUT = 15  # seconds
+    DEFAULT_HTTP_RETRIES = 3
+    RETRY_DELAY_MAX = 10  # seconds
+    BACKOFF_MULTIPLIER = 2
+    UPLOAD_TIMEOUT = 60 * 30  # 30 minutes
+    UPLOAD_CHUNK_SIZE = 8192  # bytes
+    DEFAULT_DOWNLOAD_CHUNK_SIZE = 1024  # bytes
+    DEFAULT_AUTH_ERROR_STATUS = [401]
+
+    # A Duet 2 WiFi processes only 3 HTTP requests at a time (NumHttpResponders)
+    # and its ESP8266 offers 8 TCP sockets in total, shared with every other
+    # client. Serialize our own short requests so we never claim more than one
+    # slot, and cap the connection pool at one extra slot for a running stream.
+    MAX_CONCURRENT_REQUESTS = 1
+    MAX_CONNECTIONS = 2
+
+    # Upper bound on re-authentications within a single retried request, so a
+    # board that keeps answering 401 cannot turn into an endless rr_connect loop.
+    MAX_REAUTH_ATTEMPTS = 3
+
+    address = attr.ib(type=str, default="http://10.42.0.2")
+    password = attr.ib(type=str, default="reprap")
+    session_timeout = attr.ib(type=int, default=DEFAULT_SESSION_TIMEOUT)
+    http_timeout = attr.ib(type=int, default=DEFAULT_HTTP_TIMEOUT)
+    http_retries = attr.ib(type=int, default=DEFAULT_HTTP_RETRIES)
+    session = attr.ib(type=aiohttp.ClientSession, default=None)
+    logger = attr.ib(type=logging.Logger, factory=logging.getLogger)
+    callbacks = attr.ib(type=dict, factory=dict)
+    _reconnect_lock = attr.ib(type=Optional[asyncio.Lock], default=None)
+    _request_semaphore = attr.ib(type=Optional[asyncio.Semaphore], default=None)
+    _http_busy_streak = attr.ib(type=int, default=0)
+
+    @address.validator
+    def _validate_address(self, attribute, value):
+        valid_schemes = ('http://', 'https://', 'file://')
+        if not any(value.startswith(s) for s in valid_schemes):
+            raise ValueError('Address must start with http://, https://, or file://')
+
+    # On Python 3.9 asyncio primitives bind to the event loop that is current
+    # when they are constructed. These objects are built outside the loop, so
+    # both primitives are created on first use instead, from inside it.
+
+    @property
+    def reconnect_lock(self) -> asyncio.Lock:
+        """Return the reconnect lock, bound to the running loop on first use."""
+        if self._reconnect_lock is None:
+            self._reconnect_lock = asyncio.Lock()
+        return self._reconnect_lock
+
+    @property
+    def request_semaphore(self) -> asyncio.Semaphore:
+        """Return the request semaphore, bound to the running loop on first use."""
+        if self._request_semaphore is None:
+            self._request_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_REQUESTS)
+        return self._request_semaphore
+
+    async def connect(self) -> dict:
+        """Connect to the Duet."""
+        return await self.reconnect()
+
+    @abc.abstractmethod
+    async def reconnect(self) -> dict:
+        """Reconnect to the Duet."""
+
+    async def close(self) -> None:
+        """Close the Client Session."""
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
+            self.session = None
+
+    @contextlib.asynccontextmanager
+    async def _request(self, method: str, url: str, **kwargs):
+        """Issue an HTTP request while holding the concurrency semaphore.
+
+        The semaphore is released as soon as the caller leaves the context, so
+        a retry backoff never keeps the slot occupied. Streaming transfers
+        deliberately bypass this helper; they are bounded by the connection
+        pool instead, otherwise a long upload would stall the polling loop.
+
+        :param method: HTTP method, 'get' or 'post'
+        :param url: Request URL
+        :param kwargs: Passed through to the aiohttp session method
+        """
+        if method == 'get':
+            request = self.session.get
+        elif method == 'post':
+            request = self.session.post
+        else:
+            raise ValueError(f'Unsupported HTTP method: {method}')
+
+        async with self.request_semaphore:
+            async with request(url, **kwargs) as response:
+                yield response
+                # Reached only when the caller left the block without error,
+                # so the board is answering again and any busy streak is over.
+                self._http_busy_streak = 0
+
+    async def _handle_response_error(
+        self,
+        error,
+        remaining,
+        retries,
+        auth_error_status,
+        reauths,
+    ):
+        """Handle an HTTP response error during a retried request.
+
+        Returns the updated (remaining retry count, remaining reauth count).
+        Raises the error if it is not retriable.
+        """
+        if error.status in self.callbacks:
+            await self.callbacks[error.status](error)
+            return remaining, reauths
+        if error.status not in auth_error_status:
+            raise error
+        if reauths <= 0:
+            self.logger.error(
+                f'Auth error ({error.status}) while requesting'
+                f' {error.request_info!s} - giving up after'
+                f' {self.MAX_REAUTH_ATTEMPTS} reauthentications',
+            )
+            raise error
+        self.logger.error(
+            f'Auth error ({error.status}) while requesting'
+            f' {error.request_info!s} - retry',
+        )
+        try:
+            await self.reconnect()
+            return retries, reauths - 1
+        except _TRANSIENT_ERRORS as e:
+            self.logger.error(f"Reconnect failed: {e}")
+            return remaining, reauths - 1
+
+    async def _ensure_session(self) -> None:
+        """Ensure a valid session."""
+        if self.session is None or self.session.closed:
+            await self.reconnect()
+
+    @abc.abstractmethod
+    async def send_gcode(self, command: str, no_reply: bool = True) -> str:
+        """Send a G-code command.
+
+        :param command: G-code command string
+        :param no_reply: If True, don't wait for a reply
+        :return: Reply string (empty if no_reply=True)
+        """
+
+    @abc.abstractmethod
+    async def download(
+        self,
+        filepath: str,
+        chunk_size: Optional[int] = DEFAULT_DOWNLOAD_CHUNK_SIZE,
+    ) -> AsyncIterable:
+        """Download a file from the printer.
+
+        :param filepath: Path to file on printer
+        :param chunk_size: Size of chunks to yield
+        """
+
+    @abc.abstractmethod
+    async def upload_stream(
+        self,
+        filepath: str,
+        file: BinaryIO,
+        progress: Optional[Callable] = None,
+    ) -> None:
+        """Upload a file to the printer using streaming.
+
+        :param filepath: Destination path on printer
+        :param file: File-like object to upload
+        :param progress: Optional progress callback (0-100)
+        :raises IOError: If the upload fails
+        """
+
+    @abc.abstractmethod
+    async def delete(self, filepath: str) -> None:
+        """Delete a file on the printer.
+
+        :param filepath: Path to file on printer
+        """
+
+    @abc.abstractmethod
+    async def fileinfo(self, filepath: str, **kwargs) -> dict:
+        """Get file information.
+
+        :param filepath: Path to file on printer
+        :return: File information dict
+        """
+
+    @abc.abstractmethod
+    async def filelist(self, directory: str) -> list:
+        """List files in a directory.
+
+        :param directory: Directory path
+        :return: List of files
+        """
+
+    @abc.abstractmethod
+    async def mkdir(self, directory: str) -> None:
+        """Create a directory.
+
+        :param directory: Directory path to create
+        """
+
+    @abc.abstractmethod
+    async def move(
+        self,
+        old_filepath: str,
+        new_filepath: str,
+        overwrite: bool = False,
+    ) -> None:
+        """Move/rename a file.
+
+        :param old_filepath: Source path
+        :param new_filepath: Destination path
+        :param overwrite: Overwrite existing file
+        """

@@ -4,164 +4,186 @@
 
 import asyncio
 import datetime
-import logging
 from typing import AsyncIterable, BinaryIO, Callable, Optional
 from zlib import crc32
 
 import aiohttp
-
 import attr
 
-
-def reauthenticate(retries=3):
-    """Reauthenticate HTTP API requests."""
-
-    def decorator(f):
-
-        async def inner(*args, **kwargs):
-            status = {"retries": retries}
-            while status["retries"]:
-                try:
-                    return await f(*args, **kwargs)
-                except (
-                    TimeoutError,
-                    aiohttp.ClientPayloadError,
-                    aiohttp.ClientConnectionError,
-                ) as e:
-                    args[0].logger.error(f"{e} - retry")
-                    status["retries"] -= 1
-                    await asyncio.sleep(5**(retries - status["retries"]))
-                except aiohttp.ClientResponseError as e:
-                    status["retries"] -= 1
-                    if e.status in args[0].callbacks:
-                        await args[0].callbacks[e.status](e)
-                    elif e.status == 401:
-                        args[0].logger.error(
-                            "Unauthorized  while requesting {!s} - retry".format(
-                                e.request_info,
-                            ),
-                        )
-                        await asyncio.sleep(5**(retries - status["retries"]))
-                        response = await args[0].reconnect()
-                        if response["err"] == 0:
-                            status["retries"] = retries
-                    else:
-                        raise e
-            raise TimeoutError(
-                "Retried {} times to reauthenticate.".format(retries),
-            )
-
-        return inner
-
-    return decorator
+from .base import DuetAPIBase, reauthenticate
 
 
 @attr.s
-class RepRapFirmware:
+class RepRapFirmware(DuetAPIBase):
     """RepRapFirmware API Class."""
 
-    address = attr.ib(type=str, default="http://10.42.0.2")
+    REPLY_CACHE_TTL = 10  # seconds
+
+    # HTTP status codes
+    HTTP_UNAUTHORIZED = 401
+    HTTP_BAD_GATEWAY = 502
+    HTTP_SERVICE_UNAVAILABLE = 503
+
+    # Delay before retrying after HTTP errors (seconds)
+    HTTP_ERROR_RETRY_DELAY = 5
+    HTTP_ERROR_RETRY_DELAY_MAX = 30
+
+    # Timeout for the best-effort rr_disconnect when tearing a session down
+    DISCONNECT_TIMEOUT = 3
+
+    # Default model query depth
+    DEFAULT_MODEL_DEPTH = 99
+
+    # CRC32 bitmask for unsigned 32-bit result
+    CRC32_MASK = 0xffffffff
+
+    # Progress percentage upper bound
+    PROGRESS_MAX = 100.0
+
     password = attr.ib(type=str, default="meltingplot")
-    session_timeout = attr.ib(type=int, default=8000)
-    http_timeout = attr.ib(type=int, default=15)
-    http_retries = attr.ib(type=int, default=3)
-    session = attr.ib(type=aiohttp.ClientSession, default=None)
-    logger = attr.ib(type=logging.Logger, factory=logging.getLogger)
-    callbacks = attr.ib(type=dict, factory=dict)
-    _reconnect_lock = attr.ib(type=asyncio.Lock, factory=asyncio.Lock)
-    _last_reply = attr.ib(type=str, default="")
+    _last_reply = attr.ib(type=str, default='')
     _last_reply_timeout = attr.ib(type=datetime.datetime, factory=datetime.datetime.now)
 
     def __attrs_post_init__(self):
         """Post init."""
-        self.callbacks[502] = self._default_http_502_bad_gateway_callback
-        self.callbacks[503] = self._default_http_503_busy_callback
+        self.callbacks[self.HTTP_BAD_GATEWAY] = self._default_http_502_bad_gateway_callback
+        self.callbacks[self.HTTP_SERVICE_UNAVAILABLE] = self._default_http_503_busy_callback
+
+    def _busy_backoff_delay(self) -> float:
+        """Return the next backoff delay and advance the busy streak.
+
+        The streak is reset by :meth:`_request` on the first successful
+        response, so a board that recovers is polled again straight away.
+        """
+        delay = min(
+            self.HTTP_ERROR_RETRY_DELAY * (2**self._http_busy_streak),
+            self.HTTP_ERROR_RETRY_DELAY_MAX,
+        )
+        self._http_busy_streak += 1
+        return delay
 
     async def _default_http_502_bad_gateway_callback(self, e):
         # a reverse proxy may return HTTP status code 502 if the Duet is not available
-        # duet to open socket limit. In this case, we retry the request.
-        self.logger.error("Duet bad gateway  {!s} - retry".format(e.request_info))
-        await asyncio.sleep(5)
+        # due to open socket limit. In this case, we retry the request.
+        self.logger.error(f'Duet bad gateway {e.request_info!s} - retry')
+        await asyncio.sleep(self._busy_backoff_delay())
 
     async def _default_http_503_busy_callback(self, e):
-        # Besides, RepRapFirmware may run short on memory and
-        # may not be able to respond properly. In this case,
-        # HTTP status code 503 is returned.
-        self.logger.error("Duet busy  {!s} - retry".format(e.request_info))
-        await asyncio.sleep(5)
-
-    @address.validator
-    def _validate_address(self, attribute, value):
-        if not value.startswith("http://") and not value.startswith("https://"):
-            raise ValueError("Address must start with http:// or https://")
-
-    async def connect(self) -> dict:
-        """Connect to the Duet."""
-        return await self.reconnect()
+        # RepRapFirmware pins a gcode reply until as many clients have fetched
+        # it as there are open HTTP sessions; until then those output buffers
+        # are unavailable for assembling rr_model responses and we get a 503.
+        # Fetch our share of the reply so the board can release the buffers.
+        self.logger.error(f'Duet busy {e.request_info!s} - retry')
+        self.logger.debug(f"Received HTTP 503 for {e.request_info!s}")
+        try:
+            reply = self._cache_reply(await self._fetch_reply(), nocache=True)
+            if reply:
+                self.logger.debug(f"Drained pending reply: {reply[:200]}")
+        except Exception as drain_err:
+            self.logger.debug(f"Failed to drain reply buffer: {drain_err}")
+        await asyncio.sleep(self._busy_backoff_delay())
 
     async def reconnect(self) -> dict:
         """Reconnect to the Duet."""
         # Prevent multiple reconnects
-        if self._reconnect_lock.locked():
+        if self.reconnect_lock.locked():
             # Wait for reconnect to finish
-            async with self._reconnect_lock:
-                return {"err": 0}
+            async with self.reconnect_lock:
+                return {'err': 0}
 
-        async with self._reconnect_lock:
-            url = "{0}/rr_connect".format(self.address)
+        async with self.reconnect_lock:
+            url = f'{self.address}/rr_connect'
 
             params = {
-                "password": self.password,
-                "sessionKey": "yes",
+                'password': self.password,
+                'sessionKey': 'yes',
             }
 
             if self.session is None or self.session.closed:
+                # force_close because RepRapFirmware answers every rr_* request
+                # with 'Connection: close'; a pooled socket would only yield
+                # ServerDisconnectedError. The limits keep us to one slot for
+                # regular requests plus one for a concurrent stream.
+                connector = aiohttp.TCPConnector(
+                    force_close=True,
+                    limit=self.MAX_CONNECTIONS,
+                    limit_per_host=self.MAX_CONNECTIONS,
+                )
                 self.session = aiohttp.ClientSession(
+                    connector=connector,
                     timeout=aiohttp.ClientTimeout(total=self.http_timeout),
                     raise_for_status=True,
                 )
             else:
+                # Hand the previous session slot back before asking for a new
+                # one. rr_connect with sessionKey=yes allocates unconditionally,
+                # and the board only has eight slots for every client together.
+                await self._release_session()
                 self.session.headers.clear()
 
             json_response = {}
-            async with self.session.get(url, params=params) as r:
+            async with self._request('get', url, params=params) as r:
                 json_response = await r.json()
 
-            try:
-                if json_response["err"] == 0:
-                    if "sessionKey" in json_response:
-                        self.session.headers["X-Session-Key"] = "{!s}".format(
-                            json_response["sessionKey"],
-                        )
-                    if "sessionTimeout" in json_response:
-                        self.session_timeout = json_response["sessionTimeout"]
-            except KeyError as e:
-                raise e
+            if json_response.get('err', 0) != 0:
+                raise aiohttp.ClientResponseError(
+                    request_info=aiohttp.RequestInfo(
+                        url=url,
+                        method='GET',
+                        headers={},
+                        real_url=url,
+                    ),
+                    history=(),
+                    status=self.HTTP_UNAUTHORIZED,
+                    message=f'Authentication failed: {json_response}',
+                )
+
+            if 'sessionKey' in json_response:
+                self.session.headers['X-Session-Key'] = str(json_response['sessionKey'])
+            if 'sessionTimeout' in json_response:
+                self.session_timeout = json_response['sessionTimeout']
 
             return json_response
-
-    async def close(self) -> None:
-        """Close the Client Session."""
-        if self.session is not None and not self.session.closed:
-            await self.session.close()
-            self.session = None
 
     async def disconnect(self) -> dict:
         """Disconnect from the Duet."""
         await self._ensure_session()
 
-        url = "{0}/rr_disconnect".format(self.address)
+        url = f'{self.address}/rr_disconnect'
 
         response = {}
-        async with self.session.get(url) as r:
+        async with self._request('get', url) as r:
             response = await r.json()
-        await self.close()
+        await super().close()
         return response
 
-    async def _ensure_session(self) -> None:
-        """Ensure a valid session."""
+    async def _release_session(self) -> None:
+        """Best-effort rr_disconnect to free the board's session slot.
+
+        RepRapFirmware keeps a session for HttpSessionTimeout (8s) after the
+        last request, and pins pending gcode replies until every open session
+        has fetched them. Giving the slot back explicitly avoids both.
+        """
         if self.session is None or self.session.closed:
-            await self.reconnect()
+            return
+        if 'X-Session-Key' not in self.session.headers:
+            return
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=self.DISCONNECT_TIMEOUT)
+            async with self._request('get', f'{self.address}/rr_disconnect', timeout=timeout) as r:
+                await r.read()
+        except asyncio.CancelledError:
+            # Swallowed on purpose: this runs from close(), and the caller still
+            # needs the aiohttp session torn down. The board times the slot out.
+            self.logger.debug('Cancelled while releasing the Duet session')
+        except Exception as e:
+            self.logger.debug(f"rr_disconnect failed, letting the session time out: {e}")
+
+    async def close(self) -> None:
+        """Release the Duet session, then close the Client Session."""
+        await self._release_session()
+        await super().close()
 
     @reauthenticate()
     async def rr_model(
@@ -171,7 +193,7 @@ class RepRapFirmware:
         verbose: Optional[bool] = False,
         include_null: Optional[bool] = False,
         include_obsolete: Optional[bool] = False,
-        depth: Optional[int] = 99,
+        depth: Optional[int] = DEFAULT_MODEL_DEPTH,
         array: Optional[int] = 0,
     ) -> dict:
         """rr_model Get Machine Model."""
@@ -188,16 +210,16 @@ class RepRapFirmware:
         flags = []
 
         if frequently:
-            flags.append("f")
+            flags.append('f')
 
         if verbose:
-            flags.append("v")
+            flags.append('v')
 
         if include_null:
-            flags.append("n")
+            flags.append('n')
 
         if include_obsolete:
-            flags.append("o")
+            flags.append('o')
 
         flags.append(f"d{depth}")
 
@@ -205,12 +227,12 @@ class RepRapFirmware:
             flags.append(f"a{array}")
 
         params = {
-            "key": key if key is not None else "",
-            "flags": "".join(flags),
+            'key': key if key is not None else '',
+            'flags': ''.join(flags),
         }
 
         response = {}
-        async with self.session.get(url, params=params) as r:
+        async with self._request('get', url, params=params) as r:
             response = await r.json()
         return response
 
@@ -219,39 +241,57 @@ class RepRapFirmware:
         """rr_gcode Send GCode to Duet."""
         await self._ensure_session()
 
-        url = "{0}/rr_gcode".format(self.address)
+        url = f'{self.address}/rr_gcode'
 
         params = {
-            "gcode": gcode,
+            'gcode': gcode,
         }
 
-        async with self.session.get(url, params=params):
-            pass
+        async with self._request('get', url, params=params) as r:
+            await r.read()  # Consume response to release connection
 
         if no_reply:
-            return ""
+            return ''
         else:
             return await self.rr_reply()
 
-    @reauthenticate()
-    async def rr_reply(self, nocache: bool = False) -> str:
-        """rr_reply Get Reply from Duet."""
+    async def _fetch_reply(self) -> str:
+        """Fetch the pending reply without any retry handling.
+
+        Kept separate from :meth:`rr_reply` so the HTTP 503 callback can drain
+        the board's reply buffer with a single request instead of nesting a
+        second retry loop inside the one that is already running.
+        """
         await self._ensure_session()
 
-        url = "{0}/rr_reply".format(self.address)
+        url = f'{self.address}/rr_reply'
 
-        response = ""
-        async with self.session.get(url) as r:
-            response = await r.text()
+        async with self._request('get', url) as r:
+            return await r.text()
 
-        if (nocache is False and response == "" and datetime.datetime.now() < self._last_reply_timeout):
+    def _cache_reply(self, response: str, nocache: bool) -> str:
+        """Apply the reply cache policy and return the effective reply."""
+        now = datetime.datetime.now()
+
+        # Return cached reply if: caching enabled, empty response, cache still valid
+        if not nocache and response == '' and now < self._last_reply_timeout:
             return self._last_reply
-        if nocache is False or response != "":  # Only cache if there is a new response
+
+        # Update cache with new response (only if caching enabled or response non-empty)
+        if not nocache or response != '':
             self._last_reply = response
-        self._last_reply_timeout = datetime.datetime.now() + datetime.timedelta(
-            seconds=10,
-        )
+            self._last_reply_timeout = now + datetime.timedelta(seconds=self.REPLY_CACHE_TTL)
+
         return response
+
+    @reauthenticate()
+    async def rr_reply(self, nocache: bool = False) -> str:
+        """rr_reply Get Reply from Duet.
+
+        Returns the cached reply if caching is enabled, response is empty,
+        and the cache hasn't expired. Otherwise fetches and caches new response.
+        """
+        return self._cache_reply(await self._fetch_reply(), nocache)
 
     async def rr_download(
         self,
@@ -261,12 +301,14 @@ class RepRapFirmware:
         """rr_download Download File from Duet."""
         await self._ensure_session()
 
-        url = "{0}/rr_download".format(self.address)
+        url = f'{self.address}/rr_download'
 
         params = {
-            "name": filepath,
+            'name': filepath,
         }
 
+        # Like rr_upload_stream, streaming downloads bypass the request
+        # semaphore so a slow transfer cannot block the polling loop.
         async with self.session.get(url, params=params) as r:
             async for chunk in r.content.iter_chunked(chunk_size):
                 yield chunk
@@ -281,34 +323,29 @@ class RepRapFirmware:
         """rr_upload Upload File to Duet."""
         await self._ensure_session()
 
-        url = "{0}/rr_upload".format(self.address)
+        url = f'{self.address}/rr_upload'
 
         params = {
-            "name": filepath,
+            'name': filepath,
         }
 
         if last_modified is not None:
-            params["time"] = last_modified.isoformat(timespec="seconds")
+            params['time'] = last_modified.isoformat(timespec='seconds')
 
         try:
-            checksum = crc32(content) & 0xFFFFFFFF
+            checksum = crc32(content) & self.CRC32_MASK
         except TypeError:
-            content = content.encode("utf-8")
-            checksum = crc32(content) & 0xFFFFFFFF
+            content = content.encode('utf-8')
+            checksum = crc32(content) & self.CRC32_MASK
 
-        params["crc32"] = "{0:08x}".format(checksum)
+        params['crc32'] = f'{checksum:08x}'
 
         headers = {
-            "Content-Length": str(len(content)),
+            'Content-Length': str(len(content)),
         }
 
-        response = b""
-        async with self.session.post(
-            url,
-            data=content,
-            params=params,
-            headers=headers,
-        ) as r:
+        response = b''
+        async with self._request('post', url, data=content, params=params, headers=headers) as r:
             response = await r.json()
         return response
 
@@ -322,47 +359,50 @@ class RepRapFirmware:
         """rr_upload_stream Upload File to Duet."""
         await self._ensure_session()
 
-        url = "{0}/rr_upload".format(self.address)
+        url = f'{self.address}/rr_upload'
 
         params = {
-            "name": filepath,
+            'name': filepath,
         }
 
         if last_modified is not None:
-            params["time"] = last_modified.isoformat(timespec="seconds")
+            params['time'] = last_modified.isoformat(timespec='seconds')
 
+        # Calculate CRC32 checksum by reading entire file
         checksum = 0
-        while chunk := file.read(8096):
-            checksum = crc32(chunk, checksum) & 0xFFFFFFFF
-            if progress:
-                progress(0.0)
+        while chunk := file.read(self.UPLOAD_CHUNK_SIZE):
+            checksum = crc32(chunk, checksum) & self.CRC32_MASK
 
-        checksum = checksum & 0xFFFFFFFF
         filesize = file.tell()
         file.seek(0)
 
-        params["crc32"] = "{0:08x}".format(checksum)
+        params['crc32'] = f'{checksum:08x}'
 
         async def file_chunk():
-            while chunk := file.read(8096):
+            while chunk := file.read(self.UPLOAD_CHUNK_SIZE):
                 if progress:
                     progress(
-                        max(0.0, min(100.0,
-                                     file.tell() / filesize * 100.0)),
+                        max(0.0, min(self.PROGRESS_MAX,
+                                     file.tell() / filesize * self.PROGRESS_MAX)),
                     )
                 if not chunk:
                     break
                 yield chunk
 
         timeout = aiohttp.ClientTimeout(
-            total=60 * 30,  # 30 minutes
+            total=self.UPLOAD_TIMEOUT,
         )
 
         headers = {
-            "Content-Length": str(filesize),
+            'Content-Length': str(filesize),
         }
 
-        response = b""
+        # Deliberately not routed through _request(): a multi-minute upload must
+        # not hold the request semaphore, or the polling loop would stall long
+        # enough for _printer_timeout to mark the printer offline and close the
+        # session underneath this very transfer. The connection pool caps us at
+        # MAX_CONNECTIONS instead.
+        response = b''
         async with self.session.post(
             url=url,
             data=file_chunk(),
@@ -390,14 +430,14 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = "{0}/rr_filelist".format(self.address)
+        url = f'{self.address}/rr_filelist'
 
         params = {
-            "dir": directory,
+            'dir': directory,
         }
 
         response = {}
-        async with self.session.get(url, params=params, **kwargs) as r:
+        async with self._request('get', url, params=params, **kwargs) as r:
             response = await r.json()
 
         return response
@@ -418,15 +458,15 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = "{0}/rr_fileinfo".format(self.address)
+        url = f'{self.address}/rr_fileinfo'
 
         params = {}
 
         if name is not None:
-            params["name"] = name
+            params['name'] = name
 
         response = {}
-        async with self.session.get(url, params=params, **kwargs) as r:
+        async with self._request('get', url, params=params, **kwargs) as r:
             response = await r.json()
 
         return response
@@ -444,14 +484,14 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = "{0}/rr_mkdir".format(self.address)
+        url = f'{self.address}/rr_mkdir'
 
         params = {
-            "dir": directory,
+            'dir': directory,
         }
 
         response = {}
-        async with self.session.get(url, params=params) as r:
+        async with self._request('get', url, params=params) as r:
             response = await r.json()
 
         return response
@@ -478,16 +518,16 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = "{0}/rr_move".format(self.address)
+        url = f'{self.address}/rr_move'
 
         params = {
-            "old": old_filepath,
-            "new": new_filepath,
-            "deleteexisting": "yes" if overwrite is True else "no",
+            'old': old_filepath,
+            'new': new_filepath,
+            'deleteexisting': 'yes' if overwrite is True else 'no',
         }
 
         response = {}
-        async with self.session.get(url, params=params) as r:
+        async with self._request('get', url, params=params) as r:
             response = await r.json()
 
         return response
@@ -505,14 +545,72 @@ class RepRapFirmware:
         """
         await self._ensure_session()
 
-        url = "{0}/rr_delete".format(self.address)
+        url = f'{self.address}/rr_delete'
 
         params = {
-            "name": filepath,
+            'name': filepath,
         }
 
         response = {}
-        async with self.session.get(url, params=params) as r:
+        async with self._request('get', url, params=params) as r:
             response = await r.json()
 
         return response
+
+    # --- Unified interface methods delegating to rr_* ---
+
+    async def send_gcode(self, command: str, no_reply: bool = True) -> str:
+        """Send G-code via the unified interface."""
+        await self.rr_gcode(gcode=command, no_reply=True)
+        return '' if no_reply else await self.rr_reply()
+
+    async def download(
+        self,
+        filepath: str,
+        chunk_size: Optional[int] = 1024,
+    ) -> AsyncIterable:
+        """Download a file via the unified interface."""
+        async for chunk in self.rr_download(filepath=filepath, chunk_size=chunk_size):
+            yield chunk
+
+    async def upload_stream(
+        self,
+        filepath: str,
+        file: BinaryIO,
+        progress: Optional[Callable] = None,
+    ) -> None:
+        """Upload a file via the unified interface.
+
+        :raises IOError: If the upload fails
+        """
+        response = await self.rr_upload_stream(filepath=filepath, file=file, progress=progress)
+        if response.get('err', 0) != 0:
+            raise IOError(f"Upload failed: {response}")
+
+    async def delete(self, filepath: str) -> None:
+        """Delete a file via the unified interface."""
+        await self.rr_delete(filepath=filepath)
+
+    async def fileinfo(self, filepath: str, **kwargs) -> dict:
+        """Get file info via the unified interface."""
+        response = await self.rr_fileinfo(name=filepath, **kwargs)
+        if response.get('err', 0) != 0:
+            raise FileNotFoundError(f"File not found: {filepath}")
+        return response
+
+    async def filelist(self, directory: str) -> list:
+        """List files via the unified interface."""
+        return await self.rr_filelist(directory=directory)
+
+    async def mkdir(self, directory: str) -> None:
+        """Create directory via the unified interface."""
+        await self.rr_mkdir(directory=directory)
+
+    async def move(
+        self,
+        old_filepath: str,
+        new_filepath: str,
+        overwrite: bool = False,
+    ) -> None:
+        """Move file via the unified interface."""
+        await self.rr_move(old_filepath, new_filepath, overwrite)

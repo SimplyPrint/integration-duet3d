@@ -2,11 +2,11 @@
 
 import ipaddress
 import logging
+import math
 import socket
 from urllib.parse import urlparse
 
 import click
-import PIL  # noqa
 
 from simplyprint_ws_client.const import IS_TESTING
 from simplyprint_ws_client.core.app import ClientApp
@@ -17,11 +17,25 @@ from simplyprint_ws_client.shared.cli.cli import ClientCli
 from simplyprint_ws_client.shared.logging import setup_logging
 
 from . import __version__
+from .camera import HttpCameraProtocol
 from .cli.autodiscover import AutoDiscover
 from .cli.install import install_as_service
 from .printer import DuetPrinter, DuetPrinterConfig
 from .watchdog import Watchdog
-from .webcam import DuetSnapshotCamera
+
+# Network scanning subnet prefixes
+IPV4_SUBNET_PREFIX = 24  # /24 = 256 addresses
+IPV6_SUBNET_PREFIX = 120  # /120 = 256 addresses (smaller than /64)
+
+# Watchdog configuration (seconds)
+WATCHDOG_TIMEOUT = 300  # 5 minutes
+WATCHDOG_STARTUP_OFFSET = 600  # 10 minutes initial grace period
+
+# Camera worker pool sizing
+CAMERA_WORKERS_DIVISOR = 10  # 1 worker per N configs
+
+# Password display masking
+PASSWORD_VISIBLE_CHARS = 2
 
 
 def rescan_existing_networks(app):
@@ -34,6 +48,8 @@ def rescan_existing_networks(app):
     configs = app.config_manager.get_all()
     networks = {}
     for config in configs:
+        if config.duet_uri and config.duet_uri.startswith('file://'):
+            continue
         try:
             # Attempt to resolve the URI as a URL via DNS
             hostname = urlparse(config.duet_uri).hostname  # Extract hostname from URI
@@ -76,7 +92,10 @@ def run_app(autodiscover: AutoDiscover, app, profile, watchdog: Watchdog):
 
     try:
         for network, pwd in networks.items():
-            click.echo(f"Scanning existing network: {network} with password {pwd}")
+            click.echo(
+                f"Scanning existing network: {network}"
+                f" with password {pwd[:PASSWORD_VISIBLE_CHARS]}{'*' * (len(pwd) - PASSWORD_VISIBLE_CHARS)}",
+            )
             if ":" in network:
                 autodiscover.autodiscover(
                     password=pwd,
@@ -96,10 +115,10 @@ def run_app(autodiscover: AutoDiscover, app, profile, watchdog: Watchdog):
         logging.error(f"Error during network scan: {e}")
 
     if profile:
-        import cProfile
         import atexit
-        import pstats
+        import cProfile
         import io
+        import pstats
 
         click.echo("Profiling enabled")
         pr = cProfile.Profile()
@@ -116,15 +135,18 @@ def run_app(autodiscover: AutoDiscover, app, profile, watchdog: Watchdog):
 
         atexit.register(app_exit)
 
-    watchdog.reset_sync(offset=600)  # Reset the watchdog timer
+    watchdog.reset_sync(offset=WATCHDOG_STARTUP_OFFSET)  # Reset the watchdog timer
     watchdog.start()  # Start the watchdog to start the timer
     app.run_blocking()
 
 
 def main():
     """Initiate the connector as the main entry point."""
-    watchdog = Watchdog(timeout=300)
+    watchdog = Watchdog(timeout=WATCHDOG_TIMEOUT)
     DuetPrinter.watchdog = watchdog
+
+    config_manager = ConfigManagerType.JSON(name="DuetConnector", config_t=DuetPrinterConfig)
+    camera_workers = max(1, math.ceil(len(config_manager) / CAMERA_WORKERS_DIVISOR))
 
     settings = ClientSettings(
         name="DuetConnector",
@@ -134,14 +156,12 @@ def main():
         config_factory=DuetPrinterConfig,
         allow_setup=True,
         config_manager_t=ConfigManagerType.JSON,
-        camera_workers=1,
-        camera_protocols=[DuetSnapshotCamera],
+        camera_workers=camera_workers,
+        camera_protocols=[HttpCameraProtocol],
         development=IS_TESTING,
     )
 
     setup_logging(settings)
-    logging.getLogger("PIL").setLevel(logging.INFO)
-    logging.getLogger("aiohttp.client").setLevel(logging.INFO)
 
     app = ClientApp(settings)
     cli = ClientCli(app)

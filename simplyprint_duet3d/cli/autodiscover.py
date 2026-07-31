@@ -26,9 +26,7 @@ import urllib.parse
 from typing import Optional
 
 import aiohttp
-
 import click
-
 from simplyprint_ws_client.core.app import ClientApp
 
 from ..duet.api import RepRapFirmware
@@ -279,6 +277,9 @@ class AutoDiscover:
 
         configs = self.app.config_manager.get_all()
         for config in configs:
+            if config.duet_uri and config.duet_uri.startswith('file://'):
+                self.app.logger.info(f'Skipping {config.duet_unique_id} - local socket connection.')
+                continue
             if config.duet_unique_id in clients:
                 self.app.logger.info(
                     f"Found existing config for {config.duet_unique_id}. Updating.",

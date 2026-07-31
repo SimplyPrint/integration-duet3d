@@ -10,39 +10,36 @@ import socket
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import timedelta
+from enum import IntEnum
 from typing import List, Optional
 
 import aiohttp
-
 import psutil
-
-from simplyprint_ws_client import (
-    NotificationEventPayload,
-    NotificationEventSeverity,
-    ResolveNotificationDemandData,
-)
 from simplyprint_ws_client.const import VERSION as SP_VERSION
 from simplyprint_ws_client.core.client import ClientConfigChangedEvent, DefaultClient
 from simplyprint_ws_client.core.config import PrinterConfig
 from simplyprint_ws_client.core.state import (
     FilamentSensorEnum,
     FileProgressStateEnum,
+    JobObjectEntry,
+    NotificationEventPayload,
+    NotificationEventSeverity,
     PrinterStatus,
 )
 from simplyprint_ws_client.core.state.models import NotificationEventButtonAction
 from simplyprint_ws_client.core.ws_protocol.messages import (
-    ConnectedMsg,
     FileDemandData,
     GcodeDemandData,
     MeshDataMsg,
+    ObjectsMsg,
     PluginInstallDemandData,
     PrinterSettingsMsg,
+    ResolveNotificationDemandData,
+    SkipObjectsDemandData,
 )
 from simplyprint_ws_client.shared.camera.mixin import ClientCameraMixin
 from simplyprint_ws_client.shared.files.file_download import FileDownload
 from simplyprint_ws_client.shared.hardware.physical_machine import PhysicalMachine
-
 from yarl import URL
 
 from . import __version__, ota
@@ -59,60 +56,96 @@ from .state import map_duet_state_to_printer_status
 from .task import async_supress, async_task
 from .watchdog import Watchdog
 
-#: Seconds between object model polls unless configured per printer.
-DEFAULT_POLL_INTERVAL = 1.0
-
-#: Lower bound protecting the printer from misconfigured poll intervals.
-MIN_POLL_INTERVAL = 0.1
-
 
 @dataclass
 class DuetPrinterConfig(PrinterConfig):
-    """Configuration for the VirtualClient."""
+    """Configuration for the Duet printer client."""
 
     duet_name: Optional[str] = None
     duet_uri: Optional[str] = None
     duet_password: Optional[str] = None
     duet_unique_id: Optional[str] = None
     webcam_uri: Optional[str] = None
-    #: Object model paths to fetch; None/empty means the built-in defaults,
-    #: ["*"] disables filtering and fetches the full object model.
     duet_om_include: Optional[List[str]] = None
-    #: Object model paths to never fetch, wins over duet_om_include.
     duet_om_exclude: Optional[List[str]] = None
-    #: Subtrees polled with the "frequently" flag on every tick.
     duet_om_frequent: Optional[List[str]] = None
-    #: Seconds between object model polls.
     duet_poll_interval: Optional[float] = None
 
 
-class DuetPrinter(
-    DefaultClient[DuetPrinterConfig],
-    ClientCameraMixin[DuetPrinterConfig],
-):
+class M291Mode(IntEnum):
+    """RepRapFirmware M291 message box modes (S parameter).
+
+    Modes >= OK are blocking and require M292 to acknowledge.
+    """
+
+    NONE = 0
+    CLOSE = 1
+    OK = 2
+    OK_CANCEL = 3
+    CHOICES = 4
+    INTEGER_INPUT = 5
+    FLOAT_INPUT = 6
+    STRING_INPUT = 7
+
+
+class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinterConfig]):
     """A Websocket client for the SimplyPrint.io Service."""
+
+    PRINTER_TIMEOUT = 60 * 5  # 5 minutes
+
+    # Duet printer task intervals (seconds)
+    DUET_TICK_INTERVAL = 0.5
+    DUET_ERROR_RETRY_DELAY = 10
+    DUET_RECONNECT_DELAY = 30
+
+    # File upload/download progress boundaries (percent)
+    UPLOAD_PROGRESS_START = 50
+    UPLOAD_PROGRESS_MAX = 90.0
+    DOWNLOAD_PROGRESS_MAX = 50.0
+    DOWNLOAD_PROGRESS_DIVISOR = 2.0
+    PROGRESS_NEAR_COMPLETE = 99.9
+    PROGRESS_MAX = 100.0
+    PROGRESS_TIME_FACTOR = 0.025
+
+    # File handling
+    AUTO_START_TIMEOUT = 400  # seconds
+    FILE_INFO_TIMEOUT = 10  # seconds
+    FILE_PROGRESS_UPDATE_INTERVAL = 5  # seconds
+    UPLOAD_MAX_RETRIES = 3
+    UPLOAD_RETRY_STATUSES = {401, 500, 503}
+    # Only 401 means the Duet session is gone. Reconnecting on 500/503 would
+    # claim a second of the board's eight session slots next to a live one.
+    UPLOAD_REAUTH_STATUSES = {401}
+    UPLOAD_RETRY_DELAY = 5  # seconds
+
+    # Temperatures
+    DEFAULT_AMBIENT_TEMPERATURE = 20  # Celsius
+
+    # Connector status
+    CONNECTOR_STATUS_INTERVAL = 120  # seconds
+
+    # Job info
+    JOB_STARTED_DURATION_THRESHOLD = 10  # seconds
 
     duet: DuetPrinterModel
     watchdog: Watchdog
-    _poll_interval: float = DEFAULT_POLL_INTERVAL
+
+    _last_messagebox_seq: int = -1
+    _last_build_objects: list = None
 
     def __init__(self, *args, **kwargs) -> None:
         """Initialize the client."""
         super().__init__(*args, **kwargs)
-
-        self.initialize_camera_mixin(
-            pause_timeout=10,
-            max_cache_age=timedelta(seconds=1),
-            **kwargs,
-        )
+        self.initialize_camera_mixin(**kwargs)
 
     async def init(self) -> None:
         """Initialize the client."""
-        self.logger.info("Initializing the client")
+        self.logger.info('Initializing the client')
 
         try:
             await self._initialize_tasks()
-            self.camera_uri = (URL(self.config.webcam_uri) if self.config.webcam_uri else None)
+            if self.config.webcam_uri:
+                self.camera_uri = URL(self.config.webcam_uri)
             await self._initialize_printer_info()
             await self._initialize_duet()
         except Exception as e:
@@ -125,42 +158,39 @@ class DuetPrinter(
 
     async def _initialize_duet(self) -> None:
         """Initialize the Duet printer."""
-        if not self.config.duet_uri.startswith(("http://", "https://")):
-            self.config.duet_uri = f"http://{self.config.duet_uri}"
+        if not self.config.duet_uri.startswith(('http://', 'https://', 'file://')):
+            self.config.duet_uri = f'http://{self.config.duet_uri}'
             await self.event_bus.emit(ClientConfigChangedEvent)
 
         duet_api = RepRapFirmware(
             address=self.config.duet_uri,
             password=self.config.duet_password,
-            logger=self.logger.getChild("duet_api"),
+            logger=self.logger.getChild('duet_api'),
         )
 
-        self._printer_timeout = time.time() + 60 * 5  # 5 minutes
-
-        self._poll_interval = max(
-            MIN_POLL_INTERVAL,
-            float(self.config.duet_poll_interval or DEFAULT_POLL_INTERVAL),
-        )
+        self._reset_printer_timeout()
 
         om_include = (tuple(self.config.duet_om_include) if self.config.duet_om_include else DEFAULT_OM_INCLUDE_PATHS)
         om_frequent = (
             tuple(self.config.duet_om_frequent) if self.config.duet_om_frequent else DEFAULT_OM_FREQUENT_PATHS
         )
-        om_filter = ObjectModelFilter(
-            include=om_include,
-            exclude=tuple(self.config.duet_om_exclude or ()),
-        )
-
         self.duet = DuetPrinterModel(
-            logger=self.logger.getChild("duet"),
+            logger=self.logger.getChild('duet'),
             api=duet_api,
-            om_filter=om_filter,
+            om_filter=ObjectModelFilter(
+                include=om_include,
+                exclude=tuple(self.config.duet_om_exclude or ()),
+            ),
             om_frequent_paths=om_frequent,
+            rrf_poll_interval=max(
+                0.1,
+                float(self.config.duet_poll_interval or DuetPrinterModel.DEFAULT_POLL_INTERVAL),
+            ),
         )
 
-        self.duet.events.on("connect", self._duet_on_connect)
-        self.duet.events.on("objectmodel", self._duet_on_objectmodel)
-        self.duet.events.on("state", self._duet_on_state)
+        self.duet.events.on('connect', self._duet_on_connect)
+        self.duet.events.on('objectmodel', self._duet_on_objectmodel)
+        self.duet.events.on('state', self._duet_on_state)
 
     async def _initialize_tasks(self) -> None:
         """Initialize background tasks."""
@@ -181,22 +211,18 @@ class DuetPrinter(
             self.printer.info.machine = PhysicalMachine.machine()
         self.printer.webcam_info.connected = self.config.webcam_uri is not None
 
-    async def _notify_with_setup_code(self) -> str:
-        r = await self.duet.gcode(
-            f'M291 P"Code: {self.config.short_id}" R"SimplyPrint.io Setup" S2',
-        )
-
-        return r
-
     async def _duet_on_connect(self) -> None:
         """Connect to the Duet board."""
+        self._reset_printer_timeout()
         if self.config.in_setup:
-            await self._notify_with_setup_code()
+            await self.duet.gcode(
+                f'M291 P"Code: {self.config.short_id}" R"Simplyprint.io Setup" S2',
+            )
         else:
             await self._check_and_set_cookie()
 
-        board = self.duet.om["boards"][0]
-        network = self.duet.om["network"]
+        board = self.duet.om['boards'][0]
+        network = self.duet.om['network']
 
         if self.config.duet_unique_id is None:
             await self._set_duet_unique_id(board)
@@ -212,57 +238,60 @@ class DuetPrinter(
 
     async def _set_duet_unique_id(self, board: dict) -> None:
         """Set the unique ID if it is not set and emit an event to notify the client."""
-        self.config.duet_unique_id = board["uniqueId"]
+        self.config.duet_unique_id = board['uniqueId']
         await self.event_bus.emit(ClientConfigChangedEvent)
 
     def _validate_duet_unique_id(self, board: dict) -> None:
         """Validate the unique ID."""
-        if self.config.duet_unique_id != board["uniqueId"]:
+        if self.config.duet_unique_id != board['uniqueId']:
             self.logger.error(
-                "Unique ID mismatch: {0} != {1}".format(
-                    self.config.duet_unique_id,
-                    board["uniqueId"],
-                ),
+                'Unique ID mismatch: {0} != {1}'.format(self.config.duet_unique_id, board['uniqueId']),
             )
             self.printer.status = PrinterStatus.OFFLINE
-            raise ValueError("Unique ID mismatch")
+            raise ValueError('Unique ID mismatch')
 
     def _set_printer_name(self, network: dict) -> None:
         """Set the printer name."""
         name_search = re.search(
-            r"(meltingplot)([-\. ])(MBL[ -]?[0-9]{3})([ -]{0,3})(\w{6})?[ ]?(\w+)?",
-            network["name"],
+            r'(meltingplot)([-\. ])(MBL[ -]?[0-9]{3})([ -]{0,3})(\w{6})?[ ]?(\w+)?',
+            network['name'],
             re.I,
         )
         try:
-            printer_name = name_search.group(3).replace("-", " ").strip()
+            printer_name = name_search.group(3).replace('-', ' ').strip()
             self.printer.firmware.machine_name = f"Meltingplot {printer_name}"
         except (AttributeError, IndexError):
-            self.printer.firmware.machine_name = network["name"]
+            self.printer.firmware.machine_name = network['name']
 
     def _set_firmware_info(self, board: dict) -> None:
         """Set the firmware information."""
-        self.printer.firmware.name = board["firmwareName"]
-        self.printer.firmware.version = board["firmwareVersion"]
+        self.printer.firmware.name = board['firmwareName']
+        self.printer.firmware.version = board['firmwareVersion']
         self.printer.set_api_info("Duet", __version__)
         self.printer.set_ui_info("Duet", __version__)
 
     async def _duet_on_objectmodel(self, old_om) -> None:
         """Handle Objectmodel changes."""
+        self._reset_printer_timeout()
         await self._update_printer_status()
         await self._update_filament_sensor()
         await self._mesh_compensation_status(old_om=old_om)
 
         try:
-            self._update_temperatures()
+            await self._update_temperatures()
         except KeyError:
             self.printer.bed.temperature.actual = 0.0
-            self.printer.tool0.actual = 0.0
-
-        self._update_heater_fault_notifications()
+            self.printer.tools[0].temperature.actual = 0.0
 
         if await self._is_printing():
             await self._update_job_info()
+
+        await self._handle_heater_faults(old_om=old_om)
+        await self._handle_messagebox()
+
+    def _reset_printer_timeout(self):
+        """Reset the printer timeout to 5 minutes from now."""
+        self._printer_timeout = time.time() + self.PRINTER_TIMEOUT
 
     @async_task
     async def _duet_printer_task(self):
@@ -274,9 +303,8 @@ class DuetPrinter(
                     await self.duet.close()
                 await self._ensure_duet_connection()
                 await self.duet.tick()
-                self._printer_timeout = time.time() + 60 * 5
-                await asyncio.sleep(self._poll_interval)
-            except TimeoutError:
+                await asyncio.sleep(self.DUET_TICK_INTERVAL)
+            except (TimeoutError, asyncio.TimeoutError):
                 continue
             except asyncio.CancelledError as e:
                 await self.duet.close()
@@ -286,7 +314,7 @@ class DuetPrinter(
                     "An exception occurred while ticking duet printer",
                 )
                 # TODO: log to sentry
-                await asyncio.sleep(10)
+                await asyncio.sleep(self.DUET_ERROR_RETRY_DELAY)
 
     async def _ensure_duet_connection(self):
         """Ensure the Duet connection is active."""
@@ -296,18 +324,16 @@ class DuetPrinter(
         except (
             aiohttp.ClientConnectionError,
             aiohttp.ClientResponseError,
-            asyncio.TimeoutError,
+            TimeoutError,
         ):
-            self.logger.debug("Failed to connect to Duet")
+            self.logger.debug('Failed to connect to Duet')
             await self.duet.close()
-            await asyncio.sleep(30)
+            await asyncio.sleep(self.DUET_RECONNECT_DELAY)
             raise TimeoutError
 
-    async def on_connected(self, data: ConnectedMsg) -> None:
-        """Connect to SimplyPrint.io."""
-        self.logger.info(
-            f"Connected to SimplyPrint.io name={data.data.name} setup_code={data.data.short_id}",
-        )
+    async def on_connected(self, _) -> None:
+        """Connect to Simplyprint.io."""
+        self.logger.info('Connected to Simplyprint.io')
 
         self.use_running_loop()
         self._is_stopped = False
@@ -317,7 +343,7 @@ class DuetPrinter(
 
     async def on_remove_connection(self, _) -> None:
         """Remove the connection."""
-        self.logger.info("Disconnected from SimplyPrint.io")
+        self.logger.info('Disconnected from Simplyprint.io')
         self._is_stopped = True
         for task in self._background_task:
             task.cancel()
@@ -366,11 +392,11 @@ class DuetPrinter(
         response = []
 
         for item in gcode.code:
-            if item.code == "M300" and self.config.in_setup:
+            if item.code == 'M300' and self.config.in_setup:
                 response.append(
-                    await self._notify_with_setup_code(),
+                    await self.duet.gcode(f'M291 P"Code: {self.config.short_id}" R"Simplyprint.io Setup" S2'),
                 )
-            elif item.code == "M997":
+            elif item.code == 'M997':
                 await ota.process_m997_command(self, item)
             else:
                 response.append(await self.duet.gcode(item.compress()))
@@ -379,72 +405,81 @@ class DuetPrinter(
 
     async def perform_self_upgrade(self) -> bool:
         """Perform self-upgrade and restart the API."""
-        self.logger.info("Performing self upgrade")
+        self.logger.info('Performing self upgrade')
 
         ret = ota.self_update(
-            "simplyprint_duet3d",
-            extra_index_url="https://www.piwheels.org/simple",
+            'simplyprint_duet3d',
+            extra_index_url='https://www.piwheels.org/simple',
         )
-
         if ret == 0:
-            self.logger.info("Plugin updated successfully, restarting API.")
+            self.logger.info('Plugin updated successfully, restarting API.')
             await self.on_api_restart()
             return True
 
         await self.push_notification(
             severity=NotificationEventSeverity.WARNING,
             payload=NotificationEventPayload(
-                title="Failed to update plugin",
-                message="An error occurred while updating the SimplyPrint Duet3D plugin. Please check the logs.",
+                title='Failed to update plugin',
+                message='An error occurred while updating the SimplyPrint Duet3D plugin. Please check the logs.',
             ),
         )
-
         return False
 
     async def on_gcode(self, event: GcodeDemandData) -> None:
-        """Receive GCode from SP and send GCode to duet."""
+        """
+        Receive GCode from SP and send GCode to duet.
+
+        The GCode is checked for allowed commands and then sent to the Duet.
+        """
         await self.deferred_gcode(event)
 
     def _upload_file_progress(self, progress: float) -> None:
         """Update the file upload progress."""
-        # contrains the progress from 50 - 90 %
+        # constrains the progress from UPLOAD_PROGRESS_START to UPLOAD_PROGRESS_MAX %
         self.printer.file_progress.percent = min(
-            round(50 + (max(0, min(50, progress / 2))), 0),
-            90.0,
+            round(
+                self.UPLOAD_PROGRESS_START +
+                (max(0, min(self.UPLOAD_PROGRESS_START, progress / self.DOWNLOAD_PROGRESS_DIVISOR))),
+                0,
+            ),
+            self.UPLOAD_PROGRESS_MAX,
         )
 
     async def _auto_start_file(self, filename: str) -> None:
         """Auto start the file after it has been uploaded."""
         self.logger.debug(f"Auto starting file {filename}")
         self.printer.job_info.filename = filename
-        timeout = time.time() + 400  # seconds
+        timeout = time.time() + self.AUTO_START_TIMEOUT
 
         while timeout > time.time():
             try:
-                response = await self.duet.api.rr_fileinfo(
-                    name=f"0:/gcodes/{filename}",
-                    timeout=aiohttp.ClientTimeout(total=10),
+                response = await self.duet.fileinfo(
+                    filepath=f"0:/gcodes/{filename}",
+                    timeout=aiohttp.ClientTimeout(total=self.FILE_INFO_TIMEOUT),
                 )
-                if response["err"] == 0:
-                    break
+                self.logger.debug(f"File info response: {response}")
+                break
             except (
+                FileNotFoundError,
+                aiohttp.ClientResponseError,
                 aiohttp.ClientConnectionError,
                 TimeoutError,
                 asyncio.TimeoutError,
             ):
+                self.logger.exception("An exception occurred while checking if file is ready")
                 pass
 
-            timeleft = 10 - ((timeout - time.time()) * 0.025)
-            self.printer.file_progress.percent = min(99.9, (90.0 + timeleft))
+            timeleft = self.FILE_INFO_TIMEOUT - ((timeout - time.time()) * self.PROGRESS_TIME_FACTOR)
+            self.printer.file_progress.percent = min(
+                self.PROGRESS_NEAR_COMPLETE,
+                (self.UPLOAD_PROGRESS_MAX + timeleft),
+            )
 
             await asyncio.sleep(1)
         else:
-            raise TimeoutError("Timeout while waiting for file to be ready")
+            raise TimeoutError('Timeout while waiting for file to be ready')
 
-        asyncio.run_coroutine_threadsafe(
-            self.on_start_print(None),
-            self.event_loop,
-        )
+        asyncio.create_task(self.on_start_print(None))
 
     @async_task
     async def _fileprogress_task(self) -> None:
@@ -455,9 +490,22 @@ class DuetPrinter(
         timeouts on clients with low bandwidth. The progress step between 0.5% can exceed
         the default timeout of 30 seconds, so frequent updates are necessary.
         """
-        while (not self._is_stopped and self.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING):
+        while not self._is_stopped and self.printer.file_progress.state == FileProgressStateEnum.DOWNLOADING:
             self.printer.file_progress.model_set_changed("state", "percent")
-            await asyncio.sleep(5)
+            await asyncio.sleep(self.FILE_PROGRESS_UPDATE_INTERVAL)
+
+    async def _recover_from_upload_error(
+        self,
+        error: aiohttp.ClientResponseError,
+    ) -> None:
+        """Prepare for another upload attempt after a retriable error."""
+        if error.status in self.UPLOAD_REAUTH_STATUSES:
+            # The Duet session is gone, so a new one costs us nothing.
+            await self.duet.api.reconnect()
+        else:
+            # The session is still alive and the board is merely busy.
+            # Reconnecting here would occupy a second of its eight slots.
+            await asyncio.sleep(self.UPLOAD_RETRY_DELAY)
 
     @async_task
     @async_supress
@@ -465,7 +513,7 @@ class DuetPrinter(
         self,
         event: FileDemandData,
     ) -> None:
-        """Download a file from SimplyPrint.io and upload it to the printer."""
+        """Download a file from Simplyprint.io and upload it to the printer."""
         self.logger.debug(f"Downloading file from {event.url}")
         downloader = FileDownload(self)
 
@@ -475,50 +523,64 @@ class DuetPrinter(
         # Initiate the file progress task to send updates every 10 seconds.
         await self._fileprogress_task()
 
-        with tempfile.NamedTemporaryFile(suffix=".gcode") as f:
+        with tempfile.NamedTemporaryFile(suffix='.gcode') as f:
             async for chunk in downloader.download(
                 data=event,
-                clamp_progress=(lambda x: float(max(0.0, min(50.0, x / 2.0)))),
+                clamp_progress=(
+                    lambda x: float(max(0.0, min(self.DOWNLOAD_PROGRESS_MAX, x / self.DOWNLOAD_PROGRESS_DIVISOR)))
+                ),
             ):
                 f.write(chunk)
 
             f.seek(0)
-            prefix = "0:/gcodes/"
-            retries = 3
+            prefix = '0:/gcodes/'
 
-            while retries > 0:
+            for attempt in range(self.UPLOAD_MAX_RETRIES):
                 try:
                     # Ensure progress updates are sent during the upload process.
-                    response = await self.duet.api.rr_upload_stream(
-                        filepath=f"{prefix}{event.file_name}",
+                    await self.duet.upload_stream(
+                        filepath=f'{prefix}{event.file_name}',
                         file=f,
                         progress=self._upload_file_progress,
                     )
-                    if response["err"] != 0:
-                        self.printer.file_progress.state = FileProgressStateEnum.ERROR
-                        return
                     break
+                except IOError:
+                    self.printer.file_progress.state = FileProgressStateEnum.ERROR
+                    return
                 except aiohttp.ClientResponseError as e:
-                    if e.status in {401, 500, 503}:
-                        await self.duet.api.reconnect()
+                    if e.status in self.UPLOAD_RETRY_STATUSES:
+                        self.logger.warning(
+                            "Upload failed with %d, retrying (attempt %d/%d)",
+                            e.status,
+                            attempt + 1,
+                            self.UPLOAD_MAX_RETRIES,
+                        )
+                        f.seek(0)
+                        await self._recover_from_upload_error(e)
                     else:
-                        # TODO: notify sentry
                         self.logger.exception(
                             "An exception occurred while uploading file to Duet",
                             exc_info=e,
                         )
                         raise e
-                finally:
-                    retries -= 1
+            else:
+                self.logger.error("Upload failed after %d retries", self.UPLOAD_MAX_RETRIES)
+                self.printer.file_progress.state = FileProgressStateEnum.ERROR
+                return
 
         if event.auto_start:
             await self._auto_start_file(event.file_name)
 
-        self.printer.file_progress.percent = 100.0
+        if event.skip_objects:
+            self.logger.info(f"Pre-skipping objects from file demand: {event.skip_objects}")
+            for obj_id in event.skip_objects:
+                await self.duet.gcode(f"M486 P{obj_id}")
+
+        self.printer.file_progress.percent = self.PROGRESS_MAX
         self.printer.file_progress.state = FileProgressStateEnum.READY
 
     async def on_file(self, data: FileDemandData) -> None:
-        """Download a file from SimplyPrint.io to the printer."""
+        """Download a file from Simplyprint.io to the printer."""
         self.logger.debug(f"on_file called with {data}")
         await self._download_file_from_sp_and_upload_to_duet(event=data)
 
@@ -527,112 +589,290 @@ class DuetPrinter(
         await self.duet.gcode(
             f'M23 "0:/gcodes/{self.printer.job_info.filename}"',
         )
-        await self.duet.gcode("M24")
+        await self.duet.gcode('M24')
 
     async def on_pause(self, _) -> None:
         """Pause the print job."""
-        await self.duet.gcode("M25")
+        await self.duet.gcode('M25')
 
     async def on_resume(self, _) -> None:
         """Resume the print job."""
-        await self.duet.gcode("M24")
+        await self.duet.gcode('M24')
 
     async def on_cancel(self, _) -> None:
         """Cancel the print job."""
-        await self.duet.gcode("M25")
-        await self.duet.gcode("M0")
+        await self.duet.gcode('M25')
+        await self.duet.gcode('M0')
 
-    def _update_temperatures(self) -> None:
-        """Update the printer temperatures."""
-        heaters = self.duet.om["heat"]["heaters"]
-        bed_heater_index = self.duet.om["heat"]["bedHeaters"][0]
+    async def on_skip_objects(self, data: SkipObjectsDemandData) -> None:
+        """Skip (cancel) objects during a print via M486."""
+        self.logger.info(f"Skipping objects: {data.objects}")
+        for obj_id in data.objects:
+            await self.duet.gcode(f"M486 P{obj_id}")
 
-        self.printer.bed.temperature.actual = heaters[bed_heater_index]["current"]
-        self.printer.bed.temperature.target = (
-            heaters[bed_heater_index]["active"] if heaters[0]["state"] != "off" else 0.0
-        )
+    async def _update_skipped_objects(self, job_status: dict) -> None:
+        """Report build object state back to SimplyPrint."""
+        build = job_status.get('build', {})
+        build_objects = build.get('objects', [])
 
-        self.printer.tool_count = len(self.duet.om["tools"]) or 1
+        current_object = build.get('currentObject', None)
+        if current_object is not None and current_object >= 0:
+            self.printer.job_info.object = current_object
 
-        for tool_idx, tool in enumerate(self.printer.tools):
-            heater_idx = self.duet.om["tools"][tool_idx]["heaters"][0]
-            tool.temperature.actual = heaters[heater_idx]["current"]
-            tool.temperature.target = (heaters[heater_idx]["active"] if heaters[1]["state"] != "off" else 0.0)
+        skipped = [
+            idx for idx, obj in enumerate(build_objects) if isinstance(obj, dict) and obj.get('cancelled', False)
+        ]
+        self.printer.job_info.skipped_objects = skipped
 
-        self.printer.ambient_temperature.ambient = 20
+        await self._send_build_objects(build_objects)
 
-    def _update_heater_fault_notifications(self):
-        heaters = self.duet.om["heat"]["heaters"]
-        bed_heater_index = self.duet.om["heat"]["bedHeaters"][0]
-        heater_idx_to_tool_idx = {tool["heaters"][0]: tool_idx for tool_idx, tool in enumerate(self.duet.om["tools"])}
+    async def _send_build_objects(self, build_objects: list) -> None:
+        """Send build object definitions to SimplyPrint via ObjectsMsg.
 
+        Only sends when the object list has changed since the last call.
+        """
+        if not build_objects:
+            return
+
+        if build_objects == self._last_build_objects:
+            return
+
+        self._last_build_objects = [dict(obj) for obj in build_objects if obj]
+
+        entries = []
+        for idx, obj in enumerate(build_objects):
+            if not obj:
+                continue
+            entry = JobObjectEntry(id=idx, name=obj.get('name'))
+
+            x_bounds = obj.get('x')
+            y_bounds = obj.get('y')
+            if x_bounds and y_bounds:
+                entry.bbox = [x_bounds[0], y_bounds[0], x_bounds[1], y_bounds[1]]
+                entry.center = [
+                    (x_bounds[0] + x_bounds[1]) / 2.0,
+                    (y_bounds[0] + y_bounds[1]) / 2.0,
+                ]
+
+            entries.append(entry)
+
+        await self.send(ObjectsMsg(data={"objects": entries}))
+
+    async def _handle_heater_faults(self, old_om) -> None:
+        """Handle heater faults and send notifications to SimplyPrint."""
+        heaters = self.duet.om.get('heat', {}).get('heaters', [])
         retained_events = []
 
         for heater_idx, heater in enumerate(heaters):
-            if heater["state"] != "fault":
+            try:
+                if heater['state'] != 'fault':
+                    continue
+            except (KeyError, TypeError):
                 continue
 
+            self.logger.error(f"Heater {heater_idx} is in fault state")
+            self.printer.status = PrinterStatus.ERROR
+
             event_key = ("heater_fault", heater_idx)
-            description = f"heater {heater_idx}"
-
-            if heater_idx == bed_heater_index:
-                description = "bed"
-            elif heater_idx in heater_idx_to_tool_idx:
-                tool_idx = heater_idx_to_tool_idx[heater_idx]
-                description = f"nozzle {tool_idx}"
-
-            _ = self.printer.notifications.keyed(
+            self.logger.debug(f"Creating heater fault notification for heater {heater_idx}")
+            event = self.printer.notifications.keyed(
                 event_key,
                 severity=NotificationEventSeverity.ERROR,
                 payload=NotificationEventPayload(
                     title="Heater Fault",
-                    message=f"Heater fault on {description}. Only clear the fault if you are sure it is safe!",
+                    message=f"Heater fault on heater {heater_idx}."
+                    " Only clear the fault if you are sure it is safe!",
                     data={"heater": heater_idx},
-                    actions={
-                        "reset": NotificationEventButtonAction(label="Reset fault"),
-                    },
+                    actions={"reset": NotificationEventButtonAction(label="Reset fault")},
                 ),
             )
-
+            self.logger.debug(f"Heater fault notification created: event_id={event.event_id}")
             retained_events.append(event_key)
 
-        # Only keep heater fault events that are still active.
         self.printer.notifications.filter_retain_keys(
             lambda x: isinstance(x, tuple) and x[0] == "heater_fault",
             *retained_events,
         )
 
-    async def _check_and_set_cookie(self) -> None:
-        """Check if the cookie is set and set it if it is not."""
-        self.logger.debug("Checking if cookie is set")
-        try:
-            async for _ in self.duet.api.rr_download(
-                filepath="0:/sys/simplyprint-connector.json",
-            ):
-                break
-            await asyncio.sleep(1)
-            await self.duet.api.rr_delete(filepath="0:/sys/simplyprint-connector.json")
-        except aiohttp.client_exceptions.ClientResponseError:
-            self.logger.debug("Cookie not set, setting cookie")
+    async def _handle_messagebox(self) -> None:
+        """Forward Duet M291 message boxes to SimplyPrint as notifications.
 
+        Supports M291 modes S0-S7:
+        S0: Non-blocking, no buttons
+        S1: Non-blocking, close button
+        S2: Blocking, OK button (M292 S{seq})
+        S3: Blocking, OK + Cancel (M292 S{seq} or M292 P1 S{seq})
+        S4: Blocking, custom choices (M292 P0 R{index} S{seq})
+        S5: Blocking, integer input (M292 P0 R{value} S{seq})
+        S6: Blocking, float input (M292 P0 R{value} S{seq})
+        S7: Blocking, string input (M292 P0 R"{value}" S{seq})
+        """
+        messagebox = self.duet.om.get('state', {}).get('messageBox', None)
+        retained_events = []
+
+        if messagebox is not None and isinstance(messagebox, dict):
+            raw_seq = messagebox.get('seq', None)
+            mode = messagebox.get('mode', 0)
+            title = messagebox.get('title', '') or 'Printer Message'
+            message = messagebox.get('message', '')
+            choices = messagebox.get('choices', None)
+            default = messagebox.get('default', None)
+
+            # RRF < 3.5 does not provide seq; use content hash for deduplication.
+            dedup_key = raw_seq if raw_seq is not None else hash((mode, title, message))
+            event_key = ("messagebox", dedup_key)
+
+            if dedup_key != self._last_messagebox_seq:
+                self._last_messagebox_seq = dedup_key
+
+                self.logger.debug(
+                    f"New message box: seq={raw_seq} mode={mode} title={title!r}"
+                    f" message={message!r} choices={choices} default={default}",
+                )
+
+                actions = self._messagebox_actions(mode, choices, default)
+                # the UI for Warning and Error is not made for actions
+                severity = (NotificationEventSeverity.ERROR if mode >= M291Mode.OK else NotificationEventSeverity.INFO)
+
+                self.logger.debug(f"Message box actions: {list(actions.keys())}")
+
+                event = self.printer.notifications.keyed(
+                    event_key,
+                    severity=severity,
+                    payload=NotificationEventPayload(
+                        title=title,
+                        message=message,
+                        actions=actions if actions else None,
+                        data={
+                            "mode": mode,
+                            "seq": raw_seq,
+                            "default": default,
+                        },
+                    ),
+                )
+                self.logger.debug(f"Message box notification created: event_id={event.event_id}")
+            retained_events.append(event_key)
+
+        self.printer.notifications.filter_retain_keys(
+            lambda x: isinstance(x, tuple) and x[0] == "messagebox",
+            *retained_events,
+        )
+
+    @staticmethod
+    def _messagebox_actions(mode, choices, default):
+        """Build notification actions for a Duet M291 message box mode."""
+        actions = {}
+        if mode == M291Mode.CLOSE:
+            actions["close"] = NotificationEventButtonAction(label="Close")
+        elif mode == M291Mode.OK:
+            actions["ok"] = NotificationEventButtonAction(label="OK")
+        elif mode == M291Mode.OK_CANCEL:
+            actions["ok"] = NotificationEventButtonAction(label="OK")
+            actions["cancel"] = NotificationEventButtonAction(label="Cancel")
+        elif mode == M291Mode.CHOICES and choices:
+            for idx, choice in enumerate(choices):
+                actions[f"choice_{idx}"] = NotificationEventButtonAction(label=choice)
+        elif mode in (M291Mode.INTEGER_INPUT, M291Mode.FLOAT_INPUT) and default is not None:
+            actions["default"] = NotificationEventButtonAction(label=f"Use default ({default})")
+            actions["cancel"] = NotificationEventButtonAction(label="Cancel")
+        elif mode == M291Mode.STRING_INPUT and default is not None:
+            actions["default"] = NotificationEventButtonAction(label=f'Use default ("{default}")')
+            actions["cancel"] = NotificationEventButtonAction(label="Cancel")
+        return actions
+
+    async def on_resolve_notification(self, data: ResolveNotificationDemandData) -> None:
+        """Handle notification responses from SimplyPrint.
+
+        Overrides the base DefaultClient handler to directly process
+        heater fault and messagebox responses instead of relying on
+        the wait_for_response() future mechanism.
+        """
+        self.logger.debug(
+            f"Received resolve_notification: event_id={data.event_id} action={data.action}",
+        )
+
+        event = self.printer.notifications.notifications.get(data.event_id)
+        if event is None:
+            self.logger.warning(f"No notification event found for event_id={data.event_id}")
+            return
+
+        payload_data = event.payload.data or {}
+
+        # Handle heater fault response
+        if "heater" in payload_data and data.action == "reset":
+            heater_idx = payload_data["heater"]
+            self.logger.info(f"Resetting heater {heater_idx} fault via user request")
+            await self.duet.gcode(f"M562 P{heater_idx}")
+            return
+
+        # Handle messagebox response
+        if "mode" in payload_data:
+            mode = payload_data["mode"]
+            raw_seq = payload_data.get("seq")
+            default = payload_data.get("default")
+            seq_param = f" S{raw_seq}" if raw_seq is not None else ""
+
+            if data.action == "cancel":
+                cmd = f"M292 P1{seq_param}"
+                self.logger.info(f"Message box cancelled by user, sending {cmd}")
+                await self.duet.gcode(cmd)
+            elif mode == M291Mode.CHOICES and data.action.startswith("choice_"):
+                choice_idx = data.action.split("_", 1)[1]
+                cmd = f"M292 P0 R{{{choice_idx}}}{seq_param}"
+                self.logger.info(f"Message box choice {choice_idx} selected, sending {cmd}")
+                await self.duet.gcode(cmd)
+            elif mode in (M291Mode.INTEGER_INPUT, M291Mode.FLOAT_INPUT) and data.action == "default":
+                cmd = f"M292 P0 R{{{default}}}{seq_param}"
+                self.logger.info(f"Message box default {default} accepted, sending {cmd}")
+                await self.duet.gcode(cmd)
+            elif mode == M291Mode.STRING_INPUT and data.action == "default":
+                cmd = f'M292 P0 R{{"{default}"}}{seq_param}'
+                self.logger.info(f'Message box default "{default}" accepted, sending {cmd}')
+                await self.duet.gcode(cmd)
+            else:
+                cmd = f"M292{seq_param}"
+                self.logger.info(f"Message box acknowledged, sending {cmd}")
+                await self.duet.gcode(cmd)
+            return
+
+    async def _update_temperatures(self) -> None:
+        """Update the printer temperatures."""
+        heaters = self.duet.om['heat']['heaters']
+        bed_heater_index = self.duet.om['heat']['bedHeaters'][0]
+
+        self.printer.bed.temperature.actual = heaters[bed_heater_index]['current']
+        self.printer.bed.temperature.target = (
+            heaters[bed_heater_index]['active'] if heaters[bed_heater_index]['state'] != 'off' else 0.0
+        )
+
+        for tool_idx, tool in enumerate(self.printer.tools):
+            heater_idx = self.duet.om['tools'][tool_idx]['heaters'][0]
+            tool.temperature.actual = heaters[heater_idx]['current']
+            tool.temperature.target = (heaters[heater_idx]['active'] if heaters[heater_idx]['state'] != 'off' else 0.0)
+
+        self.printer.ambient_temperature.ambient = self.DEFAULT_AMBIENT_TEMPERATURE
+
+    async def _check_and_set_cookie(self) -> None:
+        """Write the connector cookie to the printer."""
+        self.logger.debug('Setting connector cookie')
         cookie_data = {
-            "hostname": self.printer.info.hostname,
-            "ip": self.printer.info.local_ip,
-            "mac": self.printer.info.mac,
+            'hostname': self.printer.info.hostname,
+            'ip': self.printer.info.local_ip,
+            'mac': self.printer.info.mac,
         }
-        cookie_json = json.dumps(cookie_data).encode("utf-8")
-        await self.duet.api.rr_upload_stream(
-            filepath="0:/sys/simplyprint-connector.json",
+        cookie_json = json.dumps(cookie_data).encode('utf-8')
+        await self.duet.upload_stream(
+            filepath='0:/sys/simplyprint-connector.json',
             file=io.BytesIO(cookie_json),
         )
 
     @async_task
     async def _mesh_compensation_status(self, old_om) -> None:
         """Task to check for mesh compensation changes and send mesh data to SimplyPrint."""
-        old_compensation = old_om.get("move", {}).get("compensation", {})
-        compensation = self.duet.om.get("move", {}).get("compensation", {})
+        old_compensation = old_om.get('move', {}).get('compensation', {}) if old_om else {}
+        compensation = self.duet.om.get('move', {}).get('compensation', {})
 
-        if (compensation.get("file") and old_compensation.get("file") != compensation["file"]):
+        if compensation.get('file') and old_compensation.get('file') != compensation['file']:
             try:
                 await self._send_mesh_data()
             except Exception as e:
@@ -645,9 +885,9 @@ class DuetPrinter(
         bed = await self.duet.heightmap()
 
         data = {
-            "mesh_min": [bed["y_min"], bed["x_min"]],
-            "mesh_max": [bed["y_max"], bed["x_max"]],
-            "mesh_matrix": bed["mesh_data"],
+            'mesh_min': [bed['y_min'], bed['x_min']],
+            'mesh_max': [bed['y_max'], bed['x_max']],
+            'mesh_matrix': bed['mesh_data'],
         }
 
         # mesh data is matrix of y,x and z
@@ -656,31 +896,36 @@ class DuetPrinter(
         )
 
     async def _update_cpu_and_memory_info(self) -> None:
-        self.printer.cpu_info.usage = psutil.cpu_percent(interval=1)
+        loop = asyncio.get_running_loop()
+        self.printer.cpu_info.usage = await loop.run_in_executor(None, psutil.cpu_percent, 1)
         try:
-            self.printer.cpu_info.temp = psutil.sensors_temperatures()["coretemp"][0].current
-        except KeyError:
+            temps = psutil.sensors_temperatures()
+            for key in ('coretemp', 'cpu_thermal', 'k10temp', 'zenpower'):
+                if key in temps and temps[key]:
+                    self.printer.cpu_info.temp = temps[key][0].current
+                    break
+            else:
+                self.printer.cpu_info.temp = 0.0
+        except (KeyError, AttributeError, IndexError):
             self.printer.cpu_info.temp = 0.0
         self.printer.cpu_info.memory = psutil.virtual_memory().percent
 
     async def _update_printer_status(self) -> None:
         old_printer_state = self.printer.status
         is_printing = await self._is_printing()
-        self.printer.status = map_duet_state_to_printer_status(
-            self.duet.om,
-            is_printing,
-        )
+        self.printer.status = map_duet_state_to_printer_status(self.duet.om, is_printing)
 
-        if (self.printer.status == PrinterStatus.CANCELLING and old_printer_state == PrinterStatus.PRINTING):
+        if self.printer.status == PrinterStatus.CANCELLING and old_printer_state == PrinterStatus.PRINTING:
             self.printer.job_info.cancelled = True
         elif self.printer.status == PrinterStatus.OPERATIONAL:
-            if (self.printer.job_info.started or old_printer_state == PrinterStatus.PRINTING):
+            if self.printer.job_info.started or old_printer_state == PrinterStatus.PRINTING:
                 await self._mark_job_as_finished()
 
     async def _mark_job_as_finished(self) -> None:
         """Mark the current job as finished."""
         self.printer.job_info.finished = True
-        self.printer.job_info.progress = 100.0
+        self.printer.job_info.progress = self.PROGRESS_MAX
+        self._last_build_objects = None
 
     @async_task
     async def _connector_status_task(self) -> None:
@@ -688,7 +933,7 @@ class DuetPrinter(
         while not self._is_stopped:
             await self._update_cpu_and_memory_info()
             self._update_network_info()
-            await asyncio.sleep(120)
+            await asyncio.sleep(self.CONNECTOR_STATUS_INTERVAL)
 
     def _update_network_info(self) -> None:
         """Update the network information."""
@@ -697,30 +942,29 @@ class DuetPrinter(
         self.printer.info.mac = netinfo.mac
 
     async def _update_filament_sensor(self) -> None:
-        filament_monitors = self.duet.om.get("sensors", {}).get("filamentMonitors", [])
+        filament_monitors = self.duet.om.get('sensors', {}).get('filamentMonitors', [])
 
         for monitor in filament_monitors:
-            if monitor.get("enableMode", 0) > 0:
+            try:
+                enable_mode = monitor['enableMode']
+            except (KeyError, TypeError):
+                continue
+
+            if enable_mode > 0:
                 self.printer.settings.has_filament_settings = True
-                if monitor.get("status") == "ok":
+                if monitor.get('status') == 'ok':
                     self.printer.filament_sensor.state = FilamentSensorEnum.LOADED
                 else:
                     self.printer.filament_sensor.state = FilamentSensorEnum.RUNOUT
                     break  # only one sensor is needed
 
-                calibrated = monitor.get("calibrated")
-                configured = monitor.get("configured", {})
+                calibrated = monitor.get('calibrated')
+                configured = monitor.get('configured', {})
                 if calibrated and self.printer.status == PrinterStatus.PAUSED:
-                    if calibrated.get("percentMin", 0) < configured.get(
-                        "percentMin",
-                        0,
-                    ):
+                    if calibrated.get('percentMin', 0) < configured.get('percentMin', 0):
                         self.printer.filament_sensor.state = FilamentSensorEnum.RUNOUT
                         break  # only one sensor is needed
-                    if calibrated.get("percentMax", 0) < configured.get(
-                        "percentMax",
-                        0,
-                    ):
+                    if calibrated.get('percentMax', 0) < configured.get('percentMax', 0):
                         self.printer.filament_sensor.state = FilamentSensorEnum.RUNOUT
                         break  # only one sensor is needed
 
@@ -734,31 +978,30 @@ class DuetPrinter(
         }:
             return True
 
-        job_status = self.duet.om.get("job", {}).get("file", {})
-        return bool(job_status.get("filename"))
+        job_status = self.duet.om.get('job', {}).get('file', {})
+        return bool(job_status.get('filename'))
 
     async def _update_times_left(self, times_left: dict) -> None:
-        self.printer.job_info.time = (
-            times_left.get("slicer") or times_left.get(
-                "filament",
-            ) or times_left.get("file") or 0
-        )
+        self.printer.job_info.time = times_left.get('filament') or times_left.get(
+            'slicer',
+        ) or times_left.get('file') or 0
 
     async def _update_job_info(self) -> None:
-        job_status = self.duet.om.get("job", {})
+        job_status = self.duet.om.get('job', {})
 
         await self._update_job_progress(job_status)
         await self._update_job_times_left(job_status)
         await self._update_job_filename(job_status)
         await self._update_job_layer(job_status)
+        await self._update_skipped_objects(job_status)
 
     async def _update_job_progress(self, job_status: dict) -> None:
         try:
-            total_filament_required = sum(job_status["file"]["filament"])
-            current_filament = float(job_status["rawExtrusion"])
+            total_filament_required = sum(job_status['file']['filament'])
+            current_filament = float(job_status['rawExtrusion'])
             self.printer.job_info.progress = min(
-                current_filament * 100.0 / total_filament_required,
-                100.0,
+                current_filament * self.PROGRESS_MAX / total_filament_required,
+                self.PROGRESS_MAX,
             )
             self.printer.job_info.filament = round(current_filament, None)
         except (TypeError, KeyError, ZeroDivisionError):
@@ -766,25 +1009,21 @@ class DuetPrinter(
 
     async def _update_job_times_left(self, job_status: dict) -> None:
         try:
-            await self._update_times_left(times_left=job_status["timesLeft"])
+            await self._update_times_left(times_left=job_status['timesLeft'])
         except (TypeError, KeyError):
             self.printer.job_info.time = 0
 
     async def _update_job_filename(self, job_status: dict) -> None:
         try:
-            filepath = job_status["file"]["fileName"]
-            filename = pathlib.PurePath(filepath).name
-
-            if self.printer.job_info.filename != filename:
-                self.printer.job_info.filename = filename
-
-            if job_status.get("duration", 0) < 10:
+            filepath = job_status['file']['fileName']
+            self.printer.job_info.filename = pathlib.PurePath(filepath).name
+            if job_status.get('duration', 0) < self.JOB_STARTED_DURATION_THRESHOLD:
                 self.printer.job_info.started = True
         except (TypeError, KeyError):
             pass
 
     async def _update_job_layer(self, job_status: dict) -> None:
-        self.printer.job_info.layer = job_status.get("layer", 0)
+        self.printer.job_info.layer = job_status.get('layer', 0)
 
     async def tick(self, _) -> None:
         """Update the client state."""
@@ -799,11 +1038,15 @@ class DuetPrinter(
 
     async def halt(self) -> None:
         """Halt the client."""
-        self.logger.debug("halting the client")
+        self.logger.debug('halting the client')
         self._is_stopped = True
         for task in self._background_task:
             task.cancel()
         await self.duet.close()
+
+    async def teardown(self) -> None:
+        """Teardown the client."""
+        pass
 
     async def on_api_restart(self) -> None:
         """Restart the API."""
@@ -812,40 +1055,12 @@ class DuetPrinter(
         # by terminating the process
         raise KeyboardInterrupt()
 
-    async def on_resolve_notification(self, data: ResolveNotificationDemandData):
-        """Handle notification resolution events."""
-        event = self.printer.notifications.notifications.get(data.event_id)
-        if not event:
-            return
-
-        # Handle heater fault reset action.
-        if data.action == "reset" and event.payload.data.get("heater") is not None:
-            heater_idx = event.payload.data["heater"]
-            tools = self.duet.om["tools"]
-            bed_heater_index = self.duet.om["heat"]["bedHeaters"][0]
-
-            # Reset heater fault
-            await self.duet.gcode(f"M562 P{heater_idx}")
-
-            # Reactivate the heater
-            if heater_idx == bed_heater_index:
-                # Make bed active.
-                await self.duet.gcode("M144 S1")
-            else:
-                for tool_idx, tool in enumerate(tools):
-                    if heater_idx in tool["heaters"]:
-                        # Make tool active.
-                        await self.duet.gcode(f"M568 P{tool_idx} A2")
-
     async def on_plugin_install(self, event: PluginInstallDemandData) -> None:
         """Handle plugin installation demand event."""
-        # XXX: Least thread-safe code on the planet.
         plugin = event.plugins.pop()
-
-        if (plugin.get("type") != "install" and plugin.get("name") != "simplyprint-duet3d"):
+        if plugin.get('type') != 'install' and plugin.get('name') != 'simplyprint-duet3d':
             self.logger.warning(
-                f"Plugin install demand received for {plugin}, but it is not supported.",
+                f'Plugin install demand received for {plugin}, but it is not supported.',
             )
             return
-
         await self.perform_self_upgrade()

@@ -17,7 +17,7 @@ dependencies = [
     "pyee>=12.1.1",
     "requests>=2.32.5",
     "requests-toolbelt>=1.0.0",
-    "simplyprint-ws-client==1.0.1rc32",
+    "simplyprint-ws-client==1.0.1rc44",
     "strenum>=0.4.15",
 ]
 

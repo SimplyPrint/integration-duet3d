@@ -200,15 +200,14 @@ async def test_initialize_seeds_seqs():
 
 @pytest.mark.asyncio
 async def test_initialize_sbc_fetches_each_included_key_once():
-    """Initialize sbc fetches each included key once."""
+    """Initialize SBC from one full DSF model and retain included paths."""
     om = copy.deepcopy(FULL_OM)
     model, calls = make_model(om, sbc=True)
+    model.api.model = AsyncMock(return_value=om)
 
     await model._initialize_object_model()
 
-    keys = requested_keys(calls)
-    assert keys == {"", "boards", "heat", "job", "move", "network", "sensors", "seqs", "state", "tools"}
-    # deep single-shot responses are pruned to the included subtrees
+    assert calls == []
     assert model.om["move"] == {"compensation": FULL_OM["move"]["compensation"]}
     assert model.om["network"] == {"name": "printer-1"}
     assert model.om["state"] == {"status": "idle"}

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import aiohttp
 
 from .context import RepRapFirmware
+from simplyprint_duet3d.duet.base import DuetAPIBase
 
 
 @pytest.fixture

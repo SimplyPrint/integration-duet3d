@@ -1,0 +1,1122 @@
+"""Tests for the DuetPrinter class."""
+
+import asyncio
+import time
+from unittest.mock import AsyncMock, Mock, patch
+
+import aiohttp
+
+import pytest
+
+from .context import FileProgressStateEnum, DuetPrinter, DuetPrinterConfig
+from simplyprint_ws_client.core.ws_protocol.messages import FileDemandData, SkipObjectsDemandData
+from simplyprint_ws_client.core.state import PrinterStatus
+from simplyprint_duet3d.duet.model import merge_dictionary
+
+@pytest.fixture
+def virtual_client():
+    """Return a DuetPrinter instance."""
+    config = DuetPrinterConfig(
+        id="virtual",
+        token="token",
+        unique_id="unique_id",
+        duet_uri="http://example.com",
+        duet_password="password",
+        duet_unique_id="unique_id",
+        webcam_uri="http://webcam.example.com"
+    )
+    with patch.object(DuetPrinter, 'initialize_camera_mixin'):
+        client = DuetPrinter(config=config)
+    return client
+
+async def _run_upload_with_status(virtual_client, status):
+    """Drive the upload retry loop with a failing status, return the duet mock."""
+    event = FileDemandData(name="demand", demand="file")
+    event.url = "http://example.com/file.gcode"
+    event.file_name = "file.gcode"
+    event.auto_start = False
+
+    mock_duet = AsyncMock()
+    mock_duet.upload_stream.side_effect = aiohttp.ClientResponseError(
+        request_info=Mock(),
+        history=(),
+        status=status,
+        message='Error',
+    )
+    virtual_client.duet = mock_duet
+    virtual_client.event_loop = asyncio.get_running_loop()
+    virtual_client._background_task = set()
+
+    async def _no_download(*args, **kwargs):
+        for chunk in (b'G28\n',):
+            yield chunk
+
+    with patch('simplyprint_duet3d.printer.FileDownload') as downloader, \
+            patch.object(virtual_client, '_fileprogress_task', AsyncMock()), \
+            patch('asyncio.sleep', new_callable=AsyncMock) as sleep:
+        downloader.return_value.download = _no_download
+        task = await virtual_client._download_file_from_sp_and_upload_to_duet(event)
+        await task
+
+    return mock_duet, sleep
+
+
+@pytest.mark.asyncio
+async def test_upload_retry_reconnects_only_on_401(virtual_client):
+    """401 means the Duet session is gone, so reauthenticating is correct."""
+    mock_duet, _ = await _run_upload_with_status(virtual_client, 401)
+
+    assert mock_duet.api.reconnect.await_count == DuetPrinter.UPLOAD_MAX_RETRIES
+    assert virtual_client.printer.file_progress.state == FileProgressStateEnum.ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [500, 503])
+async def test_upload_retry_does_not_reconnect_on_busy(virtual_client, status):
+    """500/503 leave the session alive; reconnecting would claim a second slot."""
+    mock_duet, sleep = await _run_upload_with_status(virtual_client, status)
+
+    mock_duet.api.reconnect.assert_not_awaited()
+    sleep.assert_awaited_with(DuetPrinter.UPLOAD_RETRY_DELAY)
+    assert virtual_client.printer.file_progress.state == FileProgressStateEnum.ERROR
+
+
+@pytest.mark.skip
+@pytest.mark.asyncio
+async def test_download_and_upload_file_progress_calculation(virtual_client):
+    """Test that the file progress is calculated correctly."""
+    event = FileDemandData(
+        name="demand",
+        demand="file",
+    )
+    event.url = "http://example.com/file.gcode"
+    event.file_name = "file.gcode"
+    event.auto_start = True
+
+    mock_duet = AsyncMock()
+    await virtual_client.init()
+    virtual_client.duet = mock_duet
+    virtual_client.on_start_print = Mock()
+    asyncio.run_coroutine_threadsafe = Mock()
+    virtual_client.event_loop = asyncio.get_event_loop()
+    mock_duet.rr_upload_stream.return_value = {"err": 0}
+    mock_duet.rr_fileinfo.return_value = {"err": 0}
+
+    with patch("aiohttp.ClientSession.get") as mock_get:
+        mock_get.return_value.__aenter__.return_value.read = AsyncMock(return_value=b"file content")
+
+        task = await virtual_client._download_file_from_sp_and_upload_to_duet(event)
+        await task
+
+        assert virtual_client.printer.file_progress.percent == 100.0
+        assert virtual_client.printer.file_progress.state == FileProgressStateEnum.READY
+
+
+@pytest.mark.skip
+@pytest.mark.asyncio
+async def test_download_and_upload_file_progress_between_90_and_100(virtual_client):
+    """Test that the file progress is calculated correctly."""
+    event = FileDemandData(
+        name="demand",
+        demand="file",
+    )
+    event.url = "http://example.com/file.gcode"
+    event.file_name = "file.gcode"
+    event.auto_start = True
+
+    mock_duet = AsyncMock()
+    virtual_client.duet = mock_duet
+    virtual_client.on_start_print = Mock()
+    virtual_client.event_loop = asyncio.get_event_loop()
+    mock_duet.rr_upload_stream.return_value = {"err": 0}
+    mock_duet.rr_fileinfo.side_effect = [{"err": 1}, {"err": 1}, {"err": 0}]
+    asyncio.run_coroutine_threadsafe = Mock()
+
+    with patch("aiohttp.ClientSession.get") as mock_get:
+        mock_get.return_value.__aenter__.return_value.read = AsyncMock(return_value=b"file content")
+
+        expected_percent = iter([92.5, 98.75, 100.0])
+        # Check the values this variable is set to
+
+        def set_percent(change):
+            value = next(expected_percent)
+            assert value == change["new"]
+
+        virtual_client.printer.file_progress.observe(
+            set_percent,
+            names=["percent"],
+        )
+
+        with patch("time.time", side_effect=[0, 0, 100, 100, 350, 350, 380]):
+            task = await virtual_client._download_file_from_sp_and_upload_to_duet(event)
+            await task
+
+            assert virtual_client.printer.file_progress.percent == 100.0
+            assert virtual_client.printer.file_progress.state == FileProgressStateEnum.READY
+
+
+@pytest.mark.parametrize(
+    "source, destination, expected",
+    [
+        (
+            {'a': 1, 'b': {'c': 2}},
+            {'b': {'c': 3}},
+            {'a': 1, 'b': {'c': 3}}
+        ),
+        (
+            {'a': 1, 'b': {'c': 2, 'd': 4}},
+            {'b': {'c': 3, 'e': 5}},
+            {'a': 1, 'b': {'c': 3, 'd': 4, 'e': 5}}
+        ),
+        (
+            {'a': 1, 'b': {'c': {'d': 4, 'f': 5}}},
+            {'b': {'c': {'d': 5, 'e': 6}}},
+            {'a': 1, 'b': {'c': {'d': 5, 'e': 6, 'f': 5}}}
+        ),
+        (
+            {'a': 1, 'b': {'c': 2}},
+            {'b': {'d': 3}},
+            {'a': 1, 'b': {'c': 2, 'd': 3}}
+        ),
+        (
+            {'a': 1},
+            {'b': {'c': 3}},
+            {'a': 1, 'b': {'c': 3}}
+        ),
+        (
+            {'a': 1, 'b': [{'c': 2}, {'d': 4}]},
+            {'b': [{'c': 3}, None]},
+            {'a': 1, 'b': [{'c': 3}, {'d': 4}]}
+        ),
+        (
+            {'result': {'boards': [{'drivers': [{'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 0}, {'status': 0}], 'firmwareDate': '2024-10-07', 'firmwareFileName': 'Duet2CombinedFirmware.bin', 'firmwareName': 'RepRapFirmware for Duet 2 WiFi/Ethernet', 'firmwareVersion': '3.6.0-beta.1+1', 'freeRam': 26112, 'iapFileNameSD': 'Duet2_SDiap32_WiFiEth.bin', 'mcuTemp': {'current': 22.6, 'max': 22.8, 'min': 10.8}, 'name': 'Duet 2 WiFi', 'shortName': '2WiFi', 'uniqueId': '08DJM-9178L-L4MSJ-6J1FL-3S86J-TB2LN', 'vIn': {'current': 24.0, 'max': 24.3, 'min': 0.1}, 'wifiFirmwareFileName': 'DuetWiFiServer.bin'}], 'directories': {'system': '0:/sys/'}, 'fans': [{'actualValue': 0, 'blip': 0.1, 'frequency': 250, 'max': 1.0, 'min': 0.1, 'name': '', 'requestedValue': 0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {'sensors': []}}, {'actualValue': 0, 'blip': 0, 'frequency': 30000, 'max': 1.0, 'min': 1.0, 'name': '', 'requestedValue': 1.0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {'highTemperature': 45.0, 'lowTemperature': 45.0, 'sensors': [2]}}, {'actualValue': 0, 'blip': 0.25, 'frequency': 30000, 'max': 1.0, 'min': 0.35, 'name': '', 'requestedValue': 1.0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {'highTemperature': 30.0, 'lowTemperature': 30.0, 'sensors': [3]}}], 'global': {'filament_extrusion_temp_compensation_factor': 1, 'is_compensated': False, 'compensated_temp': 0, 'initial_temp': 0}, 'heat': {'bedHeaters': [0, -1, -1, -1], 'chamberHeaters': [-1, -1, -1, -1], 'coldExtrudeTemperature': 160.0, 'coldRetractTemperature': 90.0, 'heaters': [{'active': 0, 'avgPwm': 0, 'current': 19.41, 'max': 120.0, 'maxBadReadings': 3, 'maxHeatingFaultTime': 5.0, 'maxTempExcursion': 10.0, 'min': -273.1, 'model': {'coolingExp': 1.4, 'coolingRate': 0.224, 'deadTime': 2.2, 'enabled': True, 'fanCoolingRate': 0, 'heatingRate': 0.432, 'inverted': False, 'maxPwm': 1.0, 'pid': {'d': 1.134, 'i': 0.0777, 'overridden': False, 'p': 0.74671, 'used': True}, 'standardVoltage': 24.4}, 'monitors': [{'action': 0, 'condition': 'tooHigh', 'limit': 120.0, 'sensor': 0}, {'condition': 'disabled', 'sensor': -1}, {'condition': 'disabled', 'sensor': -1}], 'sensor': 0, 'standby': 0, 'state': 'off'}, {'active': 0, 'avgPwm': 0, 'current': 22.24, 'max': 350.0, 'maxBadReadings': 3, 'maxHeatingFaultTime': 25.0, 'maxTempExcursion': 15.0, 'min': -273.1, 'model': {'coolingExp': 1.4, 'coolingRate': 0.205, 'deadTime': 5.8, 'enabled': True, 'fanCoolingRate': 0.114, 'heatingRate': 1.962, 'inverted': False, 'maxPwm': 1.0, 'pid': {'d': 0.25, 'i': 0.0031, 'overridden': False, 'p': 0.06141, 'used': True}, 'standardVoltage': 24.0}, 'monitors': [{'action': 0, 'condition': 'tooHigh', 'limit': 350.0, 'sensor': 2}, {'condition': 'disabled', 'sensor': -1}, {'condition': 'disabled', 'sensor': -1}], 'sensor': 2, 'standby': 0, 'state': 'off'}]}, 'inputs': [{'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'HTTP', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'Marlin', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Telnet', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'File', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'Marlin', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'USB', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Aux', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Trigger', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Queue', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'LCD', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, None, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': True, 'inverseTimeMode': False, 'lineNumber': 72, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Daemon', 'selectedPlane': 0, 'stackDepth': 1, 'state': 'waiting', 'volumetric': False}, None, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Autopause', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}], 'job': {'file': {'customInfo': {}, 'filament': [], 'height': 0, 'layerHeight': 0, 'numLayers': 0, 'size': 0, 'thumbnails': []}, 'filePosition': 0, 'lastDuration': 0, 'lastWarmUpDuration': 0, 'timesLeft': {}}, 'ledStrips': [], 'limits': {}, 'move': {'axes': [{'acceleration': 3000.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['0'], 'homed': False, 'jerk': 480.0, 'letter': 'X', 'machinePosition': 0, 'max': 851.0, 'maxProbed': False, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': False, 'percentCurrent': 100, 'reducedAcceleration': 1000.0, 'speed': 20000.0, 'stepsPerMm': 80.0, 'userPosition': 0, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}, {'acceleration': 3000.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['1'], 'homed': False, 'jerk': 480.0, 'letter': 'Y', 'machinePosition': 0, 'max': 405.0, 'maxProbed': False, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': False, 'percentCurrent': 100, 'reducedAcceleration': 1000.0, 'speed': 20000.0, 'stepsPerMm': 80.0, 'userPosition': 0, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}, {'acceleration': 72.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['2', '3', '4'], 'homed': False, 'jerk': 18.0, 'letter': 'Z', 'machinePosition': 0, 'max': 392.98, 'maxProbed': True, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': True, 'percentCurrent': 100, 'reducedAcceleration': 72.0, 'speed': 1200.0, 'stepsPerMm': 400.0, 'userPosition': 0, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}], 'backlashFactor': 10, 'calibration': {'final': {'deviation': 0, 'mean': 0}, 'initial': {'deviation': 0, 'mean': 0}, 'numFactors': 0}, 'compensation': {'fadeHeight': 15.0, 'probeGrid': {'axes': ['X', 'Y'], 'maxs': [842.4, 379.5], 'mins': [8.6, 25.5], 'radius': -1.0, 'spacings': [49.0, 50.6]}, 'skew': {'compensateXY': True, 'tanXY': 0, 'tanXZ': 0, 'tanYZ': 0}, 'type': 'none'}, 'currentMove': {'acceleration': 0, 'deceleration': 0, 'extrusionRate': 0, 'requestedSpeed': 0, 'topSpeed': 0}, 'extruders': [{'acceleration': 1500.0, 'current': 1500, 'driver': '5', 'factor': 1.0, 'filament': 'PLA matt 0.8mm', 'filamentDiameter': 2.85, 'jerk': 180.0, 'microstepping': {'interpolated': True, 'value': 16}, 'nonlinear': {'a': 0, 'b': 0.011, 'upperLimit': 0.2}, 'percentCurrent': 100, 'position': 0, 'pressureAdvance': 0.035, 'rawPosition': 0, 'speed': 3600.0, 'stepsPerMm': 807.5}], 'idle': {'factor': 0.5, 'timeout': 30.0}, 'kinematics': {'forwardMatrix': [[0.5, 0.5, 0], [0.5, -0.5, 0], [0, 0, 1.0]], 'inverseMatrix': [[1.0, 1.0, 0], [1.0, -1.0, 0], [0, 0, 1.0]], 'name': 'coreXY', 'tiltCorrection': {'correctionFactor': 1.0, 'lastCorrections': [0, 0, 0], 'maxCorrection': 10.0, 'screwPitch': 0.5, 'screwX': [-150.0, 915.0, 915.0], 'screwY': [208.5, 373.5, 43.5]}, 'segmentation': {'minSegLength': 1.0, 'segmentsPerSec': 4.0}}, 'limitAxes': True, 'noMovesBeforeHoming': True, 'printingAcceleration': 800.0, 'queue': [{'gracePeriod': 0.01, 'length': 40}], 'rotation': {'angle': 0, 'centre': [0, 0]}, 'shaping': {'amplitudes': [0.085, 0.289, 0.37, 0.211, 0.045], 'damping': 0.05, 'delays': [0, 0.01252, 0.02503, 0.03755, 0.05006], 'frequency': 40.0, 'type': 'zvddd'}, 'speedFactor': 1.0, 'travelAcceleration': 1250.0, 'virtualEPos': 0, 'workplaceNumber': 0}, 'network': {'corsSite': '', 'hostname': 'meltingplotmbl1', 'interfaces': [{'actualIP': '10.42.0.2', 'firmwareVersion': '2.1.0', 'gateway': '0.0.0.0', 'mac': '00:00:00:00:00:00', 'ssid': 'Meltingplot_A1_539,3', 'state': 'active', 'subnet': '255.255.255.0', 'type': 'wifi'}], 'name': 'Meltingplot.MBL 136 - m83s3j'}, 'sensors': {'analog': [{'beta': 4598.0, 'c': 0.0, 'r25': 100000.0, 'rRef': 2200.0, 'port': '(e2temp,duex.e2temp,exp.thermistor3,exp.35)', 'lastReading': 19.49, 'name': 'bed', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'thermistor'}, None, {'rRef': 400, 'port': 'spi.cs1', 'lastReading': 21.91, 'name': 'hotend', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'rtdmax31865'}, {'lastReading': 22.38, 'name': 'mcu-temp', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'mcutemp'}], 'endstops': [{'highEnd': False, 'triggered': False, 'type': 'inputPin'}, {'highEnd': True, 'triggered': False, 'type': 'inputPin'}, {'highEnd': True, 'triggered': False, 'type': 'motorStallIndividual'}], 'filamentMonitors': [{'configured': {'allMoves': False, 'mmPerRev': 25.3, 'percentMax': 150, 'percentMin': 70, 'sampleDistance': 3.0}, 'position': 0, 'totalExtrusion': 0, 'enableMode': 1, 'status': 'ok', 'type': 'rotatingMagnet'}], 'gpIn': [{'value': 0}, {'value': 0}, {'value': 1}, {'value': 1}], 'probes': [{'calibrationTemperature': 87.5, 'deployedByUser': False, 'disablesHeaters': False, 'diveHeights': [8.0, 8.0], 'lastStopHeight': 0, 'maxProbeCount': 3, 'offsets': [8.6, 25.5, -2.51], 'recoveryTime': 0, 'speeds': [240.0, 240.0], 'temperatureCoefficients': [0.00118, 0], 'threshold': 500, 'tolerance': 0.03, 'travelSpeed': 14400.0, 'triggerHeight': 2.51, 'type': 1, 'value': [0]}]}, 'seqs': {'boards': 459, 'directories': 0, 'fans': 6, 'global': 4, 'heat': 14, 'inputs': 705, 'job': 1, 'ledStrips': 0, 'move': 73, 'network': 49, 'reply': 0, 'sensors': 9, 'spindles': 0, 'state': 5, 'tools': 6, 'volChanges': [1, 0], 'volumes': 383}, 'spindles': [{'active': 0, 'canReverse': False, 'current': 0, 'state': 'unconfigured'}, {'active': 0, 'canReverse': False, 'current': 0, 'state': 'unconfigured'}, {'active': 0, 'canReverse': False, 'current': 0, 'state': 'unconfigured'}, {'active': 0, 'canReverse': False, 'current': 0, 'state': 'unconfigured'}], 'state': {'atxPower': True, 'atxPowerPort': '!pson', 'currentTool': -1, 'deferredPowerDown': False, 'displayMessage': '', 'gpOut': [{'freq': 500, 'pwm': 0.5}, None, None, {'freq': 500, 'pwm': 1.0}], 'logFile': '0:/sys/eventlog.log', 'logLevel': 'warn', 'machineMode': 'FFF', 'macroRestarted': False, 'msUpTime': 561, 'nextTool': -1, 'powerFailScript': 'M913 X0 Y0 Z10 E10 G91 M83 G1 Z390 E-20 F1500', 'previousTool': -1, 'restorePoints': [{'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}], 'status': 'idle', 'time': '2024-10-14T12:09:01', 'upTime': 575}, 'tools': [{'active': [0], 'axes': [[0], [1], [2]], 'extruders': [0], 'fans': [0], 'feedForward': [0], 'filamentExtruder': 0, 'heaters': [1], 'isRetracted': False, 'mix': [1.0], 'name': '', 'number': 0, 'offsets': [0, 0, 0], 'offsetsProbed': 0, 'retraction': {'extraRestart': 0, 'length': 1.0, 'speed': 27.0, 'unretractSpeed': 14.0, 'zHop': 0.1}, 'spindle': -1, 'spindleRpm': 0, 'standby': [0], 'state': 'off', 'temperatureFeedForward': [0]}], 'volumes': [{'capacity': 31914983424, 'freeSpace': 30538039296, 'mounted': True, 'openFiles': True, 'partitionSize': 31902400512, 'speed': 20000000}, {'mounted': False}]}},
+            {'key': '', 'flags': 'fd99', 'result': {'boards': [{'drivers': [{'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 0}, {'status': 0}], 'freeRam': 26112, 'mcuTemp': {'current': 26.0}, 'vIn': {'current': 24.0}}], 'fans': [{'actualValue': 0, 'requestedValue': 0, 'rpm': -1}, {'actualValue': 0, 'requestedValue': 1.0, 'rpm': -1}, {'actualValue': 0, 'requestedValue': 1.0, 'rpm': -1}], 'heat': {'heaters': [{'active': 0, 'avgPwm': 0, 'current': 19.33, 'standby': 0, 'state': 'off'}, {'active': 0, 'avgPwm': 0, 'current': 23.09, 'standby': 0, 'state': 'off'}]}, 'inputs': [{'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, None, {'feedRate': 50.0, 'inMacro': True, 'lineNumber': 72, 'state': 'waiting'}, None, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, None, None], 'job': {'filePosition': 0, 'timesLeft': {}}, 'move': {'axes': [{'machinePosition': 0, 'userPosition': 0}, {'machinePosition': 0, 'userPosition': 0}, {'machinePosition': 0, 'userPosition': 0}], 'currentMove': {'acceleration': 0, 'deceleration': 0, 'extrusionRate': 0, 'requestedSpeed': 0, 'topSpeed': 0}, 'extruders': [{'position': 0, 'rawPosition': 0}], 'virtualEPos': 0}, 'sensors': {'analog': [{'lastReading': 19.33}, None, {'lastReading': 23.09}, {'lastReading': 25.97}], 'endstops': [{'triggered': False}, {'triggered': False}, {'triggered': False}], 'filamentMonitors': [{'position': 0, 'totalExtrusion': 0, 'status': 'ok'}], 'gpIn': [{'value': 0}, {'value': 0}, {'value': 1}, {'value': 1}], 'probes': [{'value': [0]}]}, 'seqs': {'boards': 586, 'directories': 0, 'fans': 6, 'global': 4, 'heat': 14, 'inputs': 845, 'job': 1, 'ledStrips': 0, 'move': 73, 'network': 49, 'reply': 0, 'sensors': 9, 'spindles': 0, 'state': 5, 'tools': 6, 'volChanges': [1, 0], 'volumes': 453}, 'spindles': [{'current': 0, 'state': 'unconfigured'}, {'current': 0, 'state': 'unconfigured'}, {'current': 0, 'state': 'unconfigured'}, {'current': 0, 'state': 'unconfigured'}], 'state': {'currentTool': -1, 'gpOut': [{'pwm': 0.5}, None, None, {'pwm': 1.0}], 'msUpTime': 811, 'status': 'idle', 'time': '2024-10-14T12:22:09', 'upTime': 1363}, 'tools': [{'active': [0], 'isRetracted': False, 'standby': [0], 'state': 'off'}]}},
+            {'result': {'boards': [{'drivers': [{'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 0}, {'status': 0}], 'firmwareDate': '2024-10-07', 'firmwareFileName': 'Duet2CombinedFirmware.bin', 'firmwareName': 'RepRapFirmware for Duet 2 WiFi/Ethernet', 'firmwareVersion': '3.6.0-beta.1+1', 'freeRam': 26112, 'iapFileNameSD': 'Duet2_SDiap32_WiFiEth.bin', 'mcuTemp': {'current': 26.0, 'max': 22.8, 'min': 10.8}, 'name': 'Duet 2 WiFi', 'shortName': '2WiFi', 'uniqueId': '08DJM-9178L-L4MSJ-6J1FL-3S86J-TB2LN', 'vIn': {'current': 24.0, 'max': 24.3, 'min': 0.1}, 'wifiFirmwareFileName': 'DuetWiFiServer.bin'}], 'directories': {'system': '0:/sys/'}, 'fans': [{'actualValue': 0, 'blip': 0.1, 'frequency': 250, 'max': 1.0, 'min': 0.1, 'name': '', 'requestedValue': 0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {'sensors': []}}, {'actualValue': 0, 'blip': 0, 'frequency': 30000, 'max': 1.0, 'min': 1.0, 'name': '', 'requestedValue': 1.0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {'highTemperature': 45.0, 'lowTemperature': 45.0, 'sensors': [2]}}, {'actualValue': 0, 'blip': 0.25, 'frequency': 30000, 'max': 1.0, 'min': 0.35, 'name': '', 'requestedValue': 1.0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {'highTemperature': 30.0, 'lowTemperature': 30.0, 'sensors': [3]}}], 'global': {'filament_extrusion_temp_compensation_factor': 1, 'is_compensated': False, 'compensated_temp': 0, 'initial_temp': 0}, 'heat': {'bedHeaters': [0, -1, -1, -1], 'chamberHeaters': [-1, -1, -1, -1], 'coldExtrudeTemperature': 160.0, 'coldRetractTemperature': 90.0, 'heaters': [{'active': 0, 'avgPwm': 0, 'current': 19.33, 'max': 120.0, 'maxBadReadings': 3, 'maxHeatingFaultTime': 5.0, 'maxTempExcursion': 10.0, 'min': -273.1, 'model': {'coolingExp': 1.4, 'coolingRate': 0.224, 'deadTime': 2.2, 'enabled': True, 'fanCoolingRate': 0, 'heatingRate': 0.432, 'inverted': False, 'maxPwm': 1.0, 'pid': {'d': 1.134, 'i': 0.0777, 'overridden': False, 'p': 0.74671, 'used': True}, 'standardVoltage': 24.4}, 'monitors': [{'action': 0, 'condition': 'tooHigh', 'limit': 120.0, 'sensor': 0}, {'condition': 'disabled', 'sensor': -1}, {'condition': 'disabled', 'sensor': -1}], 'sensor': 0, 'standby': 0, 'state': 'off'}, {'active': 0, 'avgPwm': 0, 'current': 23.09, 'max': 350.0, 'maxBadReadings': 3, 'maxHeatingFaultTime': 25.0, 'maxTempExcursion': 15.0, 'min': -273.1, 'model': {'coolingExp': 1.4, 'coolingRate': 0.205, 'deadTime': 5.8, 'enabled': True, 'fanCoolingRate': 0.114, 'heatingRate': 1.962, 'inverted': False, 'maxPwm': 1.0, 'pid': {'d': 0.25, 'i': 0.0031, 'overridden': False, 'p': 0.06141, 'used': True}, 'standardVoltage': 24.0}, 'monitors': [{'action': 0, 'condition': 'tooHigh', 'limit': 350.0, 'sensor': 2}, {'condition': 'disabled', 'sensor': -1}, {'condition': 'disabled', 'sensor': -1}], 'sensor': 2, 'standby': 0, 'state': 'off'}]}, 'inputs': [{'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'HTTP', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'Marlin', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Telnet', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'File', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'Marlin', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'USB', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Aux', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Trigger', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Queue', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'LCD', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, None, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': True, 'inverseTimeMode': False, 'lineNumber': 72, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Daemon', 'selectedPlane': 0, 'stackDepth': 1, 'state': 'waiting', 'volumetric': False}, None, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Autopause', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, None, None], 'job': {'file': {'customInfo': {}, 'filament': [], 'height': 0, 'layerHeight': 0, 'numLayers': 0, 'size': 0, 'thumbnails': []}, 'filePosition': 0, 'lastDuration': 0, 'lastWarmUpDuration': 0, 'timesLeft': {}}, 'ledStrips': [], 'limits': {}, 'move': {'axes': [{'acceleration': 3000.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['0'], 'homed': False, 'jerk': 480.0, 'letter': 'X', 'machinePosition': 0, 'max': 851.0, 'maxProbed': False, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': False, 'percentCurrent': 100, 'reducedAcceleration': 1000.0, 'speed': 20000.0, 'stepsPerMm': 80.0, 'userPosition': 0, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}, {'acceleration': 3000.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['1'], 'homed': False, 'jerk': 480.0, 'letter': 'Y', 'machinePosition': 0, 'max': 405.0, 'maxProbed': False, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': False, 'percentCurrent': 100, 'reducedAcceleration': 1000.0, 'speed': 20000.0, 'stepsPerMm': 80.0, 'userPosition': 0, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}, {'acceleration': 72.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['2', '3', '4'], 'homed': False, 'jerk': 18.0, 'letter': 'Z', 'machinePosition': 0, 'max': 392.98, 'maxProbed': True, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': True, 'percentCurrent': 100, 'reducedAcceleration': 72.0, 'speed': 1200.0, 'stepsPerMm': 400.0, 'userPosition': 0, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}], 'backlashFactor': 10, 'calibration': {'final': {'deviation': 0, 'mean': 0}, 'initial': {'deviation': 0, 'mean': 0}, 'numFactors': 0}, 'compensation': {'fadeHeight': 15.0, 'probeGrid': {'axes': ['X', 'Y'], 'maxs': [842.4, 379.5], 'mins': [8.6, 25.5], 'radius': -1.0, 'spacings': [49.0, 50.6]}, 'skew': {'compensateXY': True, 'tanXY': 0, 'tanXZ': 0, 'tanYZ': 0}, 'type': 'none'}, 'currentMove': {'acceleration': 0, 'deceleration': 0, 'extrusionRate': 0, 'requestedSpeed': 0, 'topSpeed': 0}, 'extruders': [{'acceleration': 1500.0, 'current': 1500, 'driver': '5', 'factor': 1.0, 'filament': 'PLA matt 0.8mm', 'filamentDiameter': 2.85, 'jerk': 180.0, 'microstepping': {'interpolated': True, 'value': 16}, 'nonlinear': {'a': 0, 'b': 0.011, 'upperLimit': 0.2}, 'percentCurrent': 100, 'position': 0, 'pressureAdvance': 0.035, 'rawPosition': 0, 'speed': 3600.0, 'stepsPerMm': 807.5}], 'idle': {'factor': 0.5, 'timeout': 30.0}, 'kinematics': {'forwardMatrix': [[0.5, 0.5, 0], [0.5, -0.5, 0], [0, 0, 1.0]], 'inverseMatrix': [[1.0, 1.0, 0], [1.0, -1.0, 0], [0, 0, 1.0]], 'name': 'coreXY', 'tiltCorrection': {'correctionFactor': 1.0, 'lastCorrections': [0, 0, 0], 'maxCorrection': 10.0, 'screwPitch': 0.5, 'screwX': [-150.0, 915.0, 915.0], 'screwY': [208.5, 373.5, 43.5]}, 'segmentation': {'minSegLength': 1.0, 'segmentsPerSec': 4.0}}, 'limitAxes': True, 'noMovesBeforeHoming': True, 'printingAcceleration': 800.0, 'queue': [{'gracePeriod': 0.01, 'length': 40}], 'rotation': {'angle': 0, 'centre': [0, 0]}, 'shaping': {'amplitudes': [0.085, 0.289, 0.37, 0.211, 0.045], 'damping': 0.05, 'delays': [0, 0.01252, 0.02503, 0.03755, 0.05006], 'frequency': 40.0, 'type': 'zvddd'}, 'speedFactor': 1.0, 'travelAcceleration': 1250.0, 'virtualEPos': 0, 'workplaceNumber': 0}, 'network': {'corsSite': '', 'hostname': 'meltingplotmbl1', 'interfaces': [{'actualIP': '10.42.0.2', 'firmwareVersion': '2.1.0', 'gateway': '0.0.0.0', 'mac': '00:00:00:00:00:00', 'ssid': 'Meltingplot_A1_539,3', 'state': 'active', 'subnet': '255.255.255.0', 'type': 'wifi'}], 'name': 'Meltingplot.MBL 136 - m83s3j'}, 'sensors': {'analog': [{'beta': 4598.0, 'c': 0.0, 'r25': 100000.0, 'rRef': 2200.0, 'port': '(e2temp,duex.e2temp,exp.thermistor3,exp.35)', 'lastReading': 19.33, 'name': 'bed', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'thermistor'}, None, {'rRef': 400, 'port': 'spi.cs1', 'lastReading': 23.09, 'name': 'hotend', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'rtdmax31865'}, {'lastReading': 25.97, 'name': 'mcu-temp', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'mcutemp'}], 'endstops': [{'highEnd': False, 'triggered': False, 'type': 'inputPin'}, {'highEnd': True, 'triggered': False, 'type': 'inputPin'}, {'highEnd': True, 'triggered': False, 'type': 'motorStallIndividual'}], 'filamentMonitors': [{'configured': {'allMoves': False, 'mmPerRev': 25.3, 'percentMax': 150, 'percentMin': 70, 'sampleDistance': 3.0}, 'position': 0, 'totalExtrusion': 0, 'enableMode': 1, 'status': 'ok', 'type': 'rotatingMagnet'}], 'gpIn': [{'value': 0}, {'value': 0}, {'value': 1}, {'value': 1}], 'probes': [{'calibrationTemperature': 87.5, 'deployedByUser': False, 'disablesHeaters': False, 'diveHeights': [8.0, 8.0], 'lastStopHeight': 0, 'maxProbeCount': 3, 'offsets': [8.6, 25.5, -2.51], 'recoveryTime': 0, 'speeds': [240.0, 240.0], 'temperatureCoefficients': [0.00118, 0], 'threshold': 500, 'tolerance': 0.03, 'travelSpeed': 14400.0, 'triggerHeight': 2.51, 'type': 1, 'value': [0]}]}, 'seqs': {'boards': 586, 'directories': 0, 'fans': 6, 'global': 4, 'heat': 14, 'inputs': 845, 'job': 1, 'ledStrips': 0, 'move': 73, 'network': 49, 'reply': 0, 'sensors': 9, 'spindles': 0, 'state': 5, 'tools': 6, 'volChanges': [1, 0], 'volumes': 453}, 'spindles': [{'active': 0, 'canReverse': False, 'current': 0, 'state': 'unconfigured'}, {'active': 0, 'canReverse': False, 'current': 0, 'state': 'unconfigured'}, {'active': 0, 'canReverse': False, 'current': 0, 'state': 'unconfigured'}, {'active': 0, 'canReverse': False, 'current': 0, 'state': 'unconfigured'}], 'state': {'atxPower': True, 'atxPowerPort': '!pson', 'currentTool': -1, 'deferredPowerDown': False, 'displayMessage': '', 'gpOut': [{'freq': 500, 'pwm': 0.5}, None, None, {'freq': 500, 'pwm': 1.0}], 'logFile': '0:/sys/eventlog.log', 'logLevel': 'warn', 'machineMode': 'FFF', 'macroRestarted': False, 'msUpTime': 811, 'nextTool': -1, 'powerFailScript': 'M913 X0 Y0 Z10 E10 G91 M83 G1 Z390 E-20 F1500', 'previousTool': -1, 'restorePoints': [{'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'toolNumber': -1}], 'status': 'idle', 'time': '2024-10-14T12:22:09', 'upTime': 1363}, 'tools': [{'active': [0], 'axes': [[0], [1], [2]], 'extruders': [0], 'fans': [0], 'feedForward': [0], 'filamentExtruder': 0, 'heaters': [1], 'isRetracted': False, 'mix': [1.0], 'name': '', 'number': 0, 'offsets': [0, 0, 0], 'offsetsProbed': 0, 'retraction': {'extraRestart': 0, 'length': 1.0, 'speed': 27.0, 'unretractSpeed': 14.0, 'zHop': 0.1}, 'spindle': -1, 'spindleRpm': 0, 'standby': [0], 'state': 'off', 'temperatureFeedForward': [0]}], 'volumes': [{'capacity': 31914983424, 'freeSpace': 30538039296, 'mounted': True, 'openFiles': True, 'partitionSize': 31902400512, 'speed': 20000000}, {'mounted': False}]}, 'key': '', 'flags': 'fd99'}
+        ),
+        (
+            {'boards': [{'accelerometer': None, 'directDisplay': None, 'drivers': [{'status': 566231040}, {'status': 0}, {'status': 0}, {'status': 0}, {'status': 0}, {'status': 0}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 0}, {'status': 0}], 'firmwareDate': '2025-01-16', 'firmwareFileName': 'Duet2CombinedFirmware.bin', 'firmwareName': 'RepRapFirmware for Duet 2 WiFi/Ethernet', 'firmwareVersion': '3.6.0-beta.3', 'freeRam': 16796, 'iapFileNameSD': 'Duet2_SDiap32_WiFiEth.bin', 'maxHeaters': 10, 'maxMotors': 12, 'mcuTemp': {'current': 30.8}, 'name': 'Duet 2 WiFi', 'shortName': '2WiFi', 'supportsDirectDisplay': True, 'uniqueId': '08DJM-9178L-L4MSJ-6J1FL-3S86J-TB2LN', 'vIn': {'current': 23.9}, 'wifiFirmwareFileName': 'DuetWiFiServer.bin'}], 'directories': {'filaments': '0:/filaments/', 'firmware': '0:/firmware/', 'gCodes': '0:/gcodes/', 'macros': '0:/macros/', 'menu': '0:/menu/', 'system': '0:/sys/', 'web': '0:/www/'}, 'fans': [{'actualValue': 0, 'blip': 0.1, 'frequency': 250, 'max': 1.0, 'min': 0.1, 'name': '', 'requestedValue': 0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {}}, {'actualValue': 1.0, 'blip': 0, 'frequency': 30000, 'max': 1.0, 'min': 1.0, 'name': '', 'requestedValue': 1.0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {}}, {'actualValue': 1.0, 'blip': 0.25, 'frequency': 30000, 'max': 1.0, 'min': 0.35, 'name': '', 'requestedValue': 1.0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {}}], 'global': {'event_driver_stall': False, 'ignoreMFMevents': False, 'filament_extrusion_temp_compensation_factor': 1, 'is_compensated': False, 'compensated_temp': 0, 'initial_temp': 0}, 'heat': {'bedHeaters': [0, -1, -1, -1], 'chamberHeaters': [-1, -1, -1, -1], 'coldExtrudeTemperature': 160.0, 'coldRetractTemperature': 90.0, 'heaters': [{'active': 100.0, 'avgPwm': 0.721, 'current': 99.93, 'max': 120.0, 'maxBadReadings': 3, 'maxHeatingFaultTime': 5.0, 'maxTempExcursion': 10.0, 'min': -273.1, 'model': {'coolingExp': 1.4, 'coolingRate': 0.224, 'deadTime': 2.2, 'enabled': True, 'fanCoolingRate': 0, 'heatingRate': 0.15, 'inverted': False, 'maxPwm': 1.0, 'pid': {'d': 3.267, 'i': 0.2238, 'overridden': False, 'p': 2.15054, 'used': True}, 'standardVoltage': 24.4}, 'monitors': [{'action': 0, 'condition': 'tooHigh', 'limit': 120.0, 'sensor': 0}, {'action': None, 'condition': 'disabled', 'limit': None, 'sensor': -1}, {'action': None, 'condition': 'disabled', 'limit': None, 'sensor': -1}], 'sensor': 0, 'standby': 0, 'state': 'active'}, {'active': 255.0, 'avgPwm': 0.478, 'current': 255.1, 'max': 350.0, 'maxBadReadings': 3, 'maxHeatingFaultTime': 25.0, 'maxTempExcursion': 15.0, 'min': -273.1, 'model': {'coolingExp': 1.4, 'coolingRate': 0.205, 'deadTime': 5.8, 'enabled': True, 'fanCoolingRate': 0.114, 'heatingRate': 1.962, 'inverted': False, 'maxPwm': 1.0, 'pid': {'d': 0.25, 'i': 0.003355, 'overridden': False, 'p': 0.061408, 'used': True}, 'standardVoltage': 24.0}, 'monitors': [{'action': 0, 'condition': 'tooHigh', 'limit': 350.0, 'sensor': 2}, {'action': None, 'condition': 'disabled', 'limit': None, 'sensor': -1}, {'action': None, 'condition': 'disabled', 'limit': None, 'sensor': -1}], 'sensor': 2, 'standby': 155.0, 'state': 'active'}]}, 'inputs': [{'active': True, 'axesRelative': True, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 2.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 109, 'macroRestartable': False, 'motionSystem': 0, 'name': 'HTTP', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'Marlin', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Telnet', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 16.7, 'inMacro': True, 'inverseTimeMode': False, 'lineNumber': 10, 'macroRestartable': False, 'motionSystem': 0, 'name': 'File', 'selectedPlane': 0, 'stackDepth': 2, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'Marlin', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'USB', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Aux', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Trigger', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 377, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Queue', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'LCD', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, None, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Daemon', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, None, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Autopause', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, None, None], 'job': {'build': {'currentObject': -1, 'm486Names': False, 'm486Numbers': False, 'objects': []}, 'duration': 168, 'file': {'customInfo': {}, 'filament': [3468.1], 'fileName': '0:/gcodes/F108_Energy_Chain_Holder_Z_Axis v20_L0.2mm_N0.4_ABS_MBL136_2h40m.gcode', 'generatedBy': 'SuperSlicer 2.7.61.0 on 2025-02-04 at 11:56:36 UTC', 'height': 59.3, 'lastModified': '2025-02-04T13:09:34', 'layerHeight': 0.2, 'numLayers': 296, 'printTime': 9586, 'simulatedTime': None, 'size': 4821779, 'thumbnails': [{'format': 'png', 'height': 64, 'offset': 99, 'size': 1820, 'width': 64}, {'format': 'png', 'height': 300, 'offset': 2044, 'size': 10468, 'width': 400}]}, 'filePosition': 14347, 'lastDuration': None, 'lastFileName': None, 'lastWarmUpDuration': None, 'layer': None, 'layerTime': None, 'pauseDuration': 0, 'rawExtrusion': 0, 'timesLeft': {'filament': None, 'file': None, 'slicer': 9429}, 'warmUpDuration': 11}, 'ledStrips': [], 'limits': {'axes': 10, 'axesPlusExtruders': 12, 'bedHeaters': 4, 'boards': 1, 'chamberHeaters': 4, 'drivers': 12, 'driversPerAxis': 6, 'extruders': 7, 'extrudersPerTool': 8, 'fans': 12, 'gpInPorts': 20, 'gpOutPorts': 20, 'heaters': 10, 'heatersPerTool': 8, 'ledStrips': 2, 'monitorsPerHeater': 3, 'portsPerHeater': 2, 'restorePoints': 6, 'sensors': 32, 'spindles': 4, 'tools': 50, 'trackedObjects': 32, 'triggers': 16, 'volumes': 2, 'workplaces': 9, 'zProbeProgramBytes': 8, 'zProbes': 4}, 'move': {'axes': [{'acceleration': 3000.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['0'], 'homed': True, 'jerk': 480.0, 'letter': 'X', 'machinePosition': 850.0, 'max': 850.0, 'maxProbed': False, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': False, 'percentCurrent': 100, 'printingJerk': 480.0, 'reducedAcceleration': 1000.0, 'speed': 20000, 'stepsPerMm': 80.0, 'userPosition': 849.994, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}, {'acceleration': 3000.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['1'], 'homed': True, 'jerk': 480.0, 'letter': 'Y', 'machinePosition': 373.525, 'max': 404.0, 'maxProbed': False, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': False, 'percentCurrent': 100, 'printingJerk': 480.0, 'reducedAcceleration': 1000.0, 'speed': 20000, 'stepsPerMm': 80.0, 'userPosition': 10.0, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}, {'acceleration': 72.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['2', '3', '4'], 'homed': True, 'jerk': 18.0, 'letter': 'Z', 'machinePosition': 0.499, 'max': 394.98, 'maxProbed': True, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': True, 'percentCurrent': 100, 'printingJerk': 18.0, 'reducedAcceleration': 72.0, 'speed': 1200.0, 'stepsPerMm': 400.0, 'userPosition': 0.5, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}], 'backlashFactor': 10, 'calibration': {'final': {'deviation': 0.0287, 'mean': -2.235e-08}, 'initial': {'deviation': 0.114, 'mean': 0.211}, 'numFactors': 3}, 'compensation': {'fadeHeight': 15.0, 'file': '0:/sys/heightmap.csv', 'liveGrid': {'axes': ['X', 'Y'], 'maxs': [842.4, 379.5], 'mins': [8.6, 25.5], 'radius': -1.0, 'spacings': [49.0, 50.6]}, 'meshDeviation': {'deviation': 0.109, 'mean': -0.0202}, 'probeGrid': {'axes': ['X', 'Y'], 'maxs': [841.4, 378.5], 'mins': [8.6, 25.5], 'radius': -1.0, 'spacings': [49.0, 50.4]}, 'skew': {'compensateXY': True, 'tanXY': 0, 'tanXZ': 0, 'tanYZ': 0}, 'type': 'mesh'}, 'currentMove': {'acceleration': 369.4, 'deceleration': 369.4, 'extrusionRate': 1.68, 'laserPwm': None, 'requestedSpeed': 16.7, 'topSpeed': 16.7}, 'extruders': [{'acceleration': 1500.0, 'current': 1500, 'driver': '5', 'factor': 1.0, 'filament': 'Titan-X 0.4mm', 'filamentDiameter': 2.85, 'jerk': 180.0, 'microstepping': {'interpolated': True, 'value': 16}, 'nonlinear': {'a': -0.0125, 'b': 0.00499, 'upperLimit': 0.2}, 'percentCurrent': 100, 'position': 680000.0, 'pressureAdvance': 0.08, 'printingJerk': 180.0, 'rawPosition': 0, 'speed': 3600.0, 'stepsPerMm': 794.88}], 'idle': {'factor': 0.5, 'timeout': 30.0}, 'kinematics': {'forwardMatrix': [[0.5, 0.5, 0], [0.5, -0.5, 0], [0, 0, 1.0]], 'inverseMatrix': [[1.0, 1.0, 0], [1.0, -1.0, 0], [0, 0, 1.0]], 'name': 'coreXY', 'tiltCorrection': {'correctionFactor': 1.0, 'lastCorrections': [0.138, 0.204, 0.393], 'maxCorrection': 10.0, 'screwPitch': 0.5, 'screwX': [-150.0, 915.0, 915.0], 'screwY': [208.5, 373.5, 43.5]}, 'segmentation': None}, 'limitAxes': True, 'noMovesBeforeHoming': True, 'printingAcceleration': 800.0, 'queue': [{'gracePeriod': 0.01, 'length': 40}], 'rotation': {'angle': 0, 'centre': [0, 0]}, 'shaping': {'amplitudes': [0.0846, 0.289, 0.37, 0.211, 0.0451], 'damping': 0.05, 'delays': [0, 0.012515, 0.025031, 0.037547, 0.050063], 'frequency': 40.0, 'type': 'zvddd'}, 'speedFactor': 1.0, 'travelAcceleration': 1250.0, 'virtualEPos': 45.0, 'workplaceNumber': 0}, 'network': {'corsSite': '', 'hostname': 'meltingplotmbl1', 'interfaces': [{'actualIP': '10.42.0.2', 'firmwareVersion': '2.2.1', 'gateway': '0.0.0.0', 'mac': '00:00:00:00:00:00', 'rssi': -20, 'ssid': 'Meltingplot_A1_539,3', 'state': 'active', 'subnet': '255.255.255.0', 'type': 'wifi'}], 'name': 'Meltingplot.MBL 136 - m83s3j'}, 'sensors': {'analog': [{'beta': 4598.0, 'c': 8.68e-08, 'r25': 100000.0, 'rRef': 2200.0, 'port': '(e2temp,duex.e2temp,exp.thermistor3,exp.35)', 'lastReading': 99.93, 'name': 'bed', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'thermistor'}, None, {'rRef': 400, 'port': 'spi.cs1', 'lastReading': 255.1, 'name': 'hotend', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'rtdmax31865'}, {'lastReading': 30.77, 'name': 'mcu-temp', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'mcutemp'}], 'endstops': [{'highEnd': False, 'probe': None, 'triggered': False, 'type': 'inputPin'}, {'highEnd': True, 'probe': None, 'triggered': False, 'type': 'inputPin'}, {'highEnd': True, 'probe': None, 'triggered': False, 'type': 'motorStallIndividual'}], 'filamentMonitors': [{'calibrated': {'mmPerRev': 25.36, 'percentMax': 107, 'percentMin': 95, 'totalDistance': 904.5}, 'configured': {'allMoves': False, 'mmPerRev': 25.3, 'percentMax': 150, 'percentMin': 70, 'sampleDistance': 3.0}, 'avgPercentage': None, 'lastPercentage': None, 'maxPercentage': None, 'minPercentage': None, 'position': 205, 'totalExtrusion': 904.5, 'enableMode': 1, 'status': 'ok', 'type': 'rotatingMagnet'}], 'gpIn': [{'value': 0}, {'value': 0}, {'value': 1}, {'value': 1}], 'probes': [{'calibrationTemperature': 87.5, 'deployedByUser': False, 'disablesHeaters': False, 'diveHeights': [8.0, 8.0], 'lastStopHeight': 0.915, 'maxProbeCount': 3, 'offsets': [8.6, 25.5, -0.9], 'recoveryTime': 0, 'speeds': [240.0, 240.0], 'temperatureCoefficients': [0.00118, 0], 'threshold': 500, 'tolerance': 0.03, 'travelSpeed': 14400, 'triggerHeight': 0.9, 'type': 1, 'value': [0]}]}, 'seqs': {'boards': 172, 'directories': 0, 'fans': 6, 'global': 9, 'heat': 14, 'inputs': 30701, 'job': 48, 'ledStrips': 0, 'move': 209, 'network': 9, 'reply': 178, 'sensors': 58, 'spindles': 0, 'state': 28, 'tools': 21, 'volChanges': [15, 0], 'volumes': 18811}, 'spindles': [{'active': None, 'canReverse': None, 'current': None, 'frequency': None, 'idlePwm': None, 'max': None, 'maxPwm': None, 'min': None, 'minPwm': None, 'state': 'unconfigured', 'type': None}, {'active': None, 'canReverse': None, 'current': None, 'frequency': None, 'idlePwm': None, 'max': None, 'maxPwm': None, 'min': None, 'minPwm': None, 'state': 'unconfigured', 'type': None}, {'active': None, 'canReverse': None, 'current': None, 'frequency': None, 'idlePwm': None, 'max': None, 'maxPwm': None, 'min': None, 'minPwm': None, 'state': 'unconfigured', 'type': None}, {'active': None, 'canReverse': None, 'current': None, 'frequency': None, 'idlePwm': None, 'max': None, 'maxPwm': None, 'min': None, 'minPwm': None, 'state': 'unconfigured', 'type': None}], 'state': {'atxPower': True, 'atxPowerPort': '!pson', 'beep': None, 'currentTool': 0, 'deferredPowerDown': False, 'displayMessage': '', 'gpOut': [{'freq': 2000, 'pwm': 1.0}, None, None, {'freq': 500, 'pwm': 1.0}], 'laserPwm': None, 'logFile': '0:/sys/eventlog.log', 'logLevel': 'warn', 'machineMode': 'FFF', 'macroRestarted': False, 'messageBox': None, 'msUpTime': 588, 'nextTool': 0, 'powerFailScript': 'M913 X0 Y0 Z10 E10 G91 M83 G1 Z390 E-20 F1500', 'previousTool': -1, 'restorePoints': [{'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}, {'coords': [435.881, 236.431, 9.899], 'extruderPos': 42.3, 'fanPwm': 0.15, 'feedRate': 79.9, 'ioBits': 0, 'laserPwm': None, 'toolNumber': 0}, {'coords': [844.988, 399.0, 114.897], 'extruderPos': 31.5, 'fanPwm': 0, 'feedRate': 2.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}, {'coords': [240.0, 50.0, 300.1], 'extruderPos': 2015.0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}], 'startupError': None, 'status': 'processing', 'thisActive': None, 'thisInput': None, 'time': '2025-02-04T13:12:24', 'upTime': 58564}, 'tools': [{'active': [250.0], 'axes': [[0], [1], [2]], 'extruders': [0], 'fans': [0], 'feedForwardAdvance': 0, 'feedForwardPwm': [0.06], 'feedForwardTemp': [8.0], 'filamentExtruder': 0, 'heaters': [1], 'isRetracted': False, 'mix': [1.0], 'name': '', 'number': 0, 'offsets': [0, 0, 0], 'offsetsProbed': 0, 'retraction': {}, 'spindle': -1, 'spindleRpm': 0, 'standby': [0], 'state': 'active'}], 'volumes': [{'capacity': 31914983424, 'freeSpace': 30374756352, 'mounted': True, 'openFiles': True, 'partitionSize': 31902400512, 'path': '0:/', 'speed': 20000000}, {'capacity': None, 'freeSpace': None, 'mounted': False, 'openFiles': None, 'partitionSize': None, 'path': '1:/', 'speed': None}]},
+            {'boards': [{'drivers': [{'status': 566231040}, {'status': 0}, {'status': 0}, {'status': 0}, {'status': 0}, {'status': 0}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 0}, {'status': 0}], 'freeRam': 16796, 'mcuTemp': {'current': 30.8}, 'vIn': {'current': 23.9}}], 'fans': [{'actualValue': 0, 'requestedValue': 0, 'rpm': -1}, {'actualValue': 1.0, 'requestedValue': 1.0, 'rpm': -1}, {'actualValue': 1.0, 'requestedValue': 1.0, 'rpm': -1}], 'heat': {'heaters': [{'active': 100.0, 'avgPwm': 0.721, 'current': 99.93, 'standby': 0, 'state': 'active'}, {'active': 255.0, 'avgPwm': 0.478, 'current': 255.1, 'standby': 155.0, 'state': 'active'}]}, 'inputs': [{'feedRate': 2.0, 'inMacro': False, 'lineNumber': 109, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 16.7, 'inMacro': True, 'lineNumber': 10, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 377, 'state': 'idle'}, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, None, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, None, {'feedRate': 50.0, 'inMacro': False, 'lineNumber': 0, 'state': 'idle'}, None, None], 'job': {'build': {'currentObject': -1}, 'duration': 169, 'filePosition': 14347, 'layer': None, 'layerTime': None, 'pauseDuration': 0, 'rawExtrusion': 0, 'timesLeft': {'filament': None, 'file': None, 'slicer': 9429}, 'warmUpDuration': 11}, 'move': {'axes': [{'machinePosition': 850.0, 'userPosition': 849.994}, {'machinePosition': 373.525, 'userPosition': 10.0}, {'machinePosition': 0.499, 'userPosition': 0.5}], 'currentMove': {'acceleration': 369.4, 'deceleration': 369.4, 'extrusionRate': 1.68, 'laserPwm': None, 'requestedSpeed': 16.7, 'topSpeed': 16.7}, 'extruders': [{'position': 680000.0, 'rawPosition': 0}], 'virtualEPos': 45.0}, 'sensors': {'analog': [{'lastReading': 99.93}, None, {'lastReading': 255.1}, {'lastReading': 30.77}], 'endstops': [{'triggered': False}, {'triggered': False}, {'triggered': False}], 'filamentMonitors': [{'calibrated': None, 'avgPercentage': None, 'lastPercentage': None, 'maxPercentage': None, 'minPercentage': None, 'position': 240, 'totalExtrusion': 3.0, 'status': 'ok'}], 'gpIn': [{'value': 0}, {'value': 0}, {'value': 1}, {'value': 1}], 'probes': [{'value': [536]}]}, 'seqs': {'boards': 172, 'directories': 0, 'fans': 6, 'global': 9, 'heat': 14, 'inputs': 30701, 'job': 48, 'ledStrips': 0, 'move': 209, 'network': 9, 'reply': 178, 'sensors': 58, 'spindles': 0, 'state': 28, 'tools': 21, 'volChanges': [18, 0], 'volumes': 18811}, 'spindles': [{'current': None, 'state': 'unconfigured'}, {'current': None, 'state': 'unconfigured'}, {'current': None, 'state': 'unconfigured'}, {'current': None, 'state': 'unconfigured'}], 'state': {'currentTool': 0, 'gpOut': [{'pwm': 1.0}, None, None, {'pwm': 1.0}], 'laserPwm': None, 'msUpTime': 115, 'status': 'processing', 'time': '2025-02-04T13:12:24', 'upTime': 58565}, 'tools': [{'active': [255.0], 'isRetracted': False, 'standby': [155.0], 'state': 'active'}]},
+            {'boards': [{'accelerometer': None, 'directDisplay': None, 'drivers': [{'status': 566231040}, {'status': 0}, {'status': 0}, {'status': 0}, {'status': 0}, {'status': 0}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 3284205568}, {'status': 0}, {'status': 0}], 'firmwareDate': '2025-01-16', 'firmwareFileName': 'Duet2CombinedFirmware.bin', 'firmwareName': 'RepRapFirmware for Duet 2 WiFi/Ethernet', 'firmwareVersion': '3.6.0-beta.3', 'freeRam': 16796, 'iapFileNameSD': 'Duet2_SDiap32_WiFiEth.bin', 'maxHeaters': 10, 'maxMotors': 12, 'mcuTemp': {'current': 30.8}, 'name': 'Duet 2 WiFi', 'shortName': '2WiFi', 'supportsDirectDisplay': True, 'uniqueId': '08DJM-9178L-L4MSJ-6J1FL-3S86J-TB2LN', 'vIn': {'current': 23.9}, 'wifiFirmwareFileName': 'DuetWiFiServer.bin'}], 'directories': {'filaments': '0:/filaments/', 'firmware': '0:/firmware/', 'gCodes': '0:/gcodes/', 'macros': '0:/macros/', 'menu': '0:/menu/', 'system': '0:/sys/', 'web': '0:/www/'}, 'fans': [{'actualValue': 0, 'blip': 0.1, 'frequency': 250, 'max': 1.0, 'min': 0.1, 'name': '', 'requestedValue': 0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {}}, {'actualValue': 1.0, 'blip': 0, 'frequency': 30000, 'max': 1.0, 'min': 1.0, 'name': '', 'requestedValue': 1.0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {}}, {'actualValue': 1.0, 'blip': 0.25, 'frequency': 30000, 'max': 1.0, 'min': 0.35, 'name': '', 'requestedValue': 1.0, 'rpm': -1, 'tachoPpr': 2.0, 'thermostatic': {}}], 'global': {'compensated_temp': 0, 'event_driver_stall': False, 'filament_extrusion_temp_compensation_factor': 1, 'ignoreMFMevents': False, 'initial_temp': 0, 'is_compensated': False}, 'heat': {'bedHeaters': [0, -1, -1, -1], 'chamberHeaters': [-1, -1, -1, -1], 'coldExtrudeTemperature': 160.0, 'coldRetractTemperature': 90.0, 'heaters': [{'active': 100.0, 'avgPwm': 0.721, 'current': 99.93, 'max': 120.0, 'maxBadReadings': 3, 'maxHeatingFaultTime': 5.0, 'maxTempExcursion': 10.0, 'min': -273.1, 'model': {'coolingExp': 1.4, 'coolingRate': 0.224, 'deadTime': 2.2, 'enabled': True, 'fanCoolingRate': 0, 'heatingRate': 0.15, 'inverted': False, 'maxPwm': 1.0, 'pid': {'d': 3.267, 'i': 0.2238, 'overridden': False, 'p': 2.15054, 'used': True}, 'standardVoltage': 24.4}, 'monitors': [{'action': 0, 'condition': 'tooHigh', 'limit': 120.0, 'sensor': 0}, {'action': None, 'condition': 'disabled', 'limit': None, 'sensor': -1}, {'action': None, 'condition': 'disabled', 'limit': None, 'sensor': -1}], 'sensor': 0, 'standby': 0, 'state': 'active'}, {'active': 255.0, 'avgPwm': 0.478, 'current': 255.1, 'max': 350.0, 'maxBadReadings': 3, 'maxHeatingFaultTime': 25.0, 'maxTempExcursion': 15.0, 'min': -273.1, 'model': {'coolingExp': 1.4, 'coolingRate': 0.205, 'deadTime': 5.8, 'enabled': True, 'fanCoolingRate': 0.114, 'heatingRate': 1.962, 'inverted': False, 'maxPwm': 1.0, 'pid': {'d': 0.25, 'i': 0.003355, 'overridden': False, 'p': 0.061408, 'used': True}, 'standardVoltage': 24.0}, 'monitors': [{'action': 0, 'condition': 'tooHigh', 'limit': 350.0, 'sensor': 2}, {'action': None, 'condition': 'disabled', 'limit': None, 'sensor': -1}, {'action': None, 'condition': 'disabled', 'limit': None, 'sensor': -1}], 'sensor': 2, 'standby': 155.0, 'state': 'active'}]}, 'inputs': [{'active': True, 'axesRelative': True, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 2.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 109, 'macroRestartable': False, 'motionSystem': 0, 'name': 'HTTP', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'Marlin', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Telnet', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 16.7, 'inMacro': True, 'inverseTimeMode': False, 'lineNumber': 10, 'macroRestartable': False, 'motionSystem': 0, 'name': 'File', 'selectedPlane': 0, 'stackDepth': 2, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'Marlin', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'USB', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Aux', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Trigger', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 377, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Queue', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'LCD', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, None, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Daemon', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, None, {'active': True, 'axesRelative': False, 'compatibility': 'RepRapFirmware', 'distanceUnit': 'mm', 'drivesRelative': True, 'feedRate': 50.0, 'inMacro': False, 'inverseTimeMode': False, 'lineNumber': 0, 'macroRestartable': False, 'motionSystem': 0, 'name': 'Autopause', 'selectedPlane': 0, 'stackDepth': 0, 'state': 'idle', 'volumetric': False}, None, None], 'job': {'build': {'currentObject': -1, 'm486Names': False, 'm486Numbers': False, 'objects': []}, 'duration': 169, 'file': {'customInfo': {}, 'filament': [3468.1], 'fileName': '0:/gcodes/F108_Energy_Chain_Holder_Z_Axis v20_L0.2mm_N0.4_ABS_MBL136_2h40m.gcode', 'generatedBy': 'SuperSlicer 2.7.61.0 on 2025-02-04 at 11:56:36 UTC', 'height': 59.3, 'lastModified': '2025-02-04T13:09:34', 'layerHeight': 0.2, 'numLayers': 296, 'printTime': 9586, 'simulatedTime': None, 'size': 4821779, 'thumbnails': [{'format': 'png', 'height': 64, 'offset': 99, 'size': 1820, 'width': 64}, {'format': 'png', 'height': 300, 'offset': 2044, 'size': 10468, 'width': 400}]}, 'filePosition': 14347, 'lastDuration': None, 'lastFileName': None, 'lastWarmUpDuration': None, 'layer': None, 'layerTime': None, 'pauseDuration': 0, 'rawExtrusion': 0, 'timesLeft': {'filament': None, 'file': None, 'slicer': 9429}, 'warmUpDuration': 11}, 'ledStrips': [], 'limits': {'axes': 10, 'axesPlusExtruders': 12, 'bedHeaters': 4, 'boards': 1, 'chamberHeaters': 4, 'drivers': 12, 'driversPerAxis': 6, 'extruders': 7, 'extrudersPerTool': 8, 'fans': 12, 'gpInPorts': 20, 'gpOutPorts': 20, 'heaters': 10, 'heatersPerTool': 8, 'ledStrips': 2, 'monitorsPerHeater': 3, 'portsPerHeater': 2, 'restorePoints': 6, 'sensors': 32, 'spindles': 4, 'tools': 50, 'trackedObjects': 32, 'triggers': 16, 'volumes': 2, 'workplaces': 9, 'zProbeProgramBytes': 8, 'zProbes': 4}, 'move': {'axes': [{'acceleration': 3000.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['0'], 'homed': True, 'jerk': 480.0, 'letter': 'X', 'machinePosition': 850.0, 'max': 850.0, 'maxProbed': False, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': False, 'percentCurrent': 100, 'printingJerk': 480.0, 'reducedAcceleration': 1000.0, 'speed': 20000, 'stepsPerMm': 80.0, 'userPosition': 849.994, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}, {'acceleration': 3000.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['1'], 'homed': True, 'jerk': 480.0, 'letter': 'Y', 'machinePosition': 373.525, 'max': 404.0, 'maxProbed': False, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': False, 'percentCurrent': 100, 'printingJerk': 480.0, 'reducedAcceleration': 1000.0, 'speed': 20000, 'stepsPerMm': 80.0, 'userPosition': 10.0, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}, {'acceleration': 72.0, 'babystep': 0, 'backlash': 0, 'current': 2000, 'drivers': ['2', '3', '4'], 'homed': True, 'jerk': 18.0, 'letter': 'Z', 'machinePosition': 0.499, 'max': 394.98, 'maxProbed': True, 'microstepping': {'interpolated': True, 'value': 16}, 'min': 0, 'minProbed': True, 'percentCurrent': 100, 'printingJerk': 18.0, 'reducedAcceleration': 72.0, 'speed': 1200.0, 'stepsPerMm': 400.0, 'userPosition': 0.5, 'visible': True, 'workplaceOffsets': [0, 0, 0, 0, 0, 0, 0, 0, 0]}], 'backlashFactor': 10, 'calibration': {'final': {'deviation': 0.0287, 'mean': -2.235e-08}, 'initial': {'deviation': 0.114, 'mean': 0.211}, 'numFactors': 3}, 'compensation': {'fadeHeight': 15.0, 'file': '0:/sys/heightmap.csv', 'liveGrid': {'axes': ['X', 'Y'], 'maxs': [842.4, 379.5], 'mins': [8.6, 25.5], 'radius': -1.0, 'spacings': [49.0, 50.6]}, 'meshDeviation': {'deviation': 0.109, 'mean': -0.0202}, 'probeGrid': {'axes': ['X', 'Y'], 'maxs': [841.4, 378.5], 'mins': [8.6, 25.5], 'radius': -1.0, 'spacings': [49.0, 50.4]}, 'skew': {'compensateXY': True, 'tanXY': 0, 'tanXZ': 0, 'tanYZ': 0}, 'type': 'mesh'}, 'currentMove': {'acceleration': 369.4, 'deceleration': 369.4, 'extrusionRate': 1.68, 'laserPwm': None, 'requestedSpeed': 16.7, 'topSpeed': 16.7}, 'extruders': [{'acceleration': 1500.0, 'current': 1500, 'driver': '5', 'factor': 1.0, 'filament': 'Titan-X 0.4mm', 'filamentDiameter': 2.85, 'jerk': 180.0, 'microstepping': {'interpolated': True, 'value': 16}, 'nonlinear': {'a': -0.0125, 'b': 0.00499, 'upperLimit': 0.2}, 'percentCurrent': 100, 'position': 680000.0, 'pressureAdvance': 0.08, 'printingJerk': 180.0, 'rawPosition': 0, 'speed': 3600.0, 'stepsPerMm': 794.88}], 'idle': {'factor': 0.5, 'timeout': 30.0}, 'kinematics': {'forwardMatrix': [[0.5, 0.5, 0], [0.5, -0.5, 0], [0, 0, 1.0]], 'inverseMatrix': [[1.0, 1.0, 0], [1.0, -1.0, 0], [0, 0, 1.0]], 'name': 'coreXY', 'segmentation': None, 'tiltCorrection': {'correctionFactor': 1.0, 'lastCorrections': [0.138, 0.204, 0.393], 'maxCorrection': 10.0, 'screwPitch': 0.5, 'screwX': [-150.0, 915.0, 915.0], 'screwY': [208.5, 373.5, 43.5]}}, 'limitAxes': True, 'noMovesBeforeHoming': True, 'printingAcceleration': 800.0, 'queue': [{'gracePeriod': 0.01, 'length': 40}], 'rotation': {'angle': 0, 'centre': [0, 0]}, 'shaping': {'amplitudes': [0.0846, 0.289, 0.37, 0.211, 0.0451], 'damping': 0.05, 'delays': [0, 0.012515, 0.025031, 0.037547, 0.050063], 'frequency': 40.0, 'type': 'zvddd'}, 'speedFactor': 1.0, 'travelAcceleration': 1250.0, 'virtualEPos': 45.0, 'workplaceNumber': 0}, 'network': {'corsSite': '', 'hostname': 'meltingplotmbl1', 'interfaces': [{'actualIP': '10.42.0.2', 'firmwareVersion': '2.2.1', 'gateway': '0.0.0.0', 'mac': '00:00:00:00:00:00', 'rssi': -20, 'ssid': 'Meltingplot_A1_539,3', 'state': 'active', 'subnet': '255.255.255.0', 'type': 'wifi'}], 'name': 'Meltingplot.MBL 136 - m83s3j'}, 'sensors': {'analog': [{'beta': 4598.0, 'c': 8.68e-08, 'lastReading': 99.93, 'name': 'bed', 'offsetAdj': 0, 'port': '(e2temp,duex.e2temp,exp.thermistor3,exp.35)', 'r25': 100000.0, 'rRef': 2200.0, 'slopeAdj': 0, 'state': 'ok', 'type': 'thermistor'}, None, {'lastReading': 255.1, 'name': 'hotend', 'offsetAdj': 0, 'port': 'spi.cs1', 'rRef': 400, 'slopeAdj': 0, 'state': 'ok', 'type': 'rtdmax31865'}, {'lastReading': 30.77, 'name': 'mcu-temp', 'offsetAdj': 0, 'slopeAdj': 0, 'state': 'ok', 'type': 'mcutemp'}], 'endstops': [{'highEnd': False, 'probe': None, 'triggered': False, 'type': 'inputPin'}, {'highEnd': True, 'probe': None, 'triggered': False, 'type': 'inputPin'}, {'highEnd': True, 'probe': None, 'triggered': False, 'type': 'motorStallIndividual'}], 'filamentMonitors': [{'avgPercentage': None, 'calibrated': None, 'configured': {'allMoves': False, 'mmPerRev': 25.3, 'percentMax': 150, 'percentMin': 70, 'sampleDistance': 3.0}, 'enableMode': 1, 'lastPercentage': None, 'maxPercentage': None, 'minPercentage': None, 'position': 240, 'status': 'ok', 'totalExtrusion': 3.0, 'type': 'rotatingMagnet'}], 'gpIn': [{'value': 0}, {'value': 0}, {'value': 1}, {'value': 1}], 'probes': [{'calibrationTemperature': 87.5, 'deployedByUser': False, 'disablesHeaters': False, 'diveHeights': [8.0, 8.0], 'lastStopHeight': 0.915, 'maxProbeCount': 3, 'offsets': [8.6, 25.5, -0.9], 'recoveryTime': 0, 'speeds': [240.0, 240.0], 'temperatureCoefficients': [0.00118, 0], 'threshold': 500, 'tolerance': 0.03, 'travelSpeed': 14400, 'triggerHeight': 0.9, 'type': 1, 'value': [536]}]}, 'seqs': {'boards': 172, 'directories': 0, 'fans': 6, 'global': 9, 'heat': 14, 'inputs': 30701, 'job': 48, 'ledStrips': 0, 'move': 209, 'network': 9, 'reply': 178, 'sensors': 58, 'spindles': 0, 'state': 28, 'tools': 21, 'volChanges': [18, 0], 'volumes': 18811}, 'spindles': [{'active': None, 'canReverse': None, 'current': None, 'frequency': None, 'idlePwm': None, 'max': None, 'maxPwm': None, 'min': None, 'minPwm': None, 'state': 'unconfigured', 'type': None}, {'active': None, 'canReverse': None, 'current': None, 'frequency': None, 'idlePwm': None, 'max': None, 'maxPwm': None, 'min': None, 'minPwm': None, 'state': 'unconfigured', 'type': None}, {'active': None, 'canReverse': None, 'current': None, 'frequency': None, 'idlePwm': None, 'max': None, 'maxPwm': None, 'min': None, 'minPwm': None, 'state': 'unconfigured', 'type': None}, {'active': None, 'canReverse': None, 'current': None, 'frequency': None, 'idlePwm': None, 'max': None, 'maxPwm': None, 'min': None, 'minPwm': None, 'state': 'unconfigured', 'type': None}], 'state': {'atxPower': True, 'atxPowerPort': '!pson', 'beep': None, 'currentTool': 0, 'deferredPowerDown': False, 'displayMessage': '', 'gpOut': [{'freq': 2000, 'pwm': 1.0}, None, None, {'freq': 500, 'pwm': 1.0}], 'laserPwm': None, 'logFile': '0:/sys/eventlog.log', 'logLevel': 'warn', 'machineMode': 'FFF', 'macroRestarted': False, 'messageBox': None, 'msUpTime': 115, 'nextTool': 0, 'powerFailScript': 'M913 X0 Y0 Z10 E10 G91 M83 G1 Z390 E-20 F1500', 'previousTool': -1, 'restorePoints': [{'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}, {'coords': [435.881, 236.431, 9.899], 'extruderPos': 42.3, 'fanPwm': 0.15, 'feedRate': 79.9, 'ioBits': 0, 'laserPwm': None, 'toolNumber': 0}, {'coords': [844.988, 399.0, 114.897], 'extruderPos': 31.5, 'fanPwm': 0, 'feedRate': 2.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}, {'coords': [0, 0, 0], 'extruderPos': 0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}, {'coords': [240.0, 50.0, 300.1], 'extruderPos': 2015.0, 'fanPwm': 0, 'feedRate': 50.0, 'ioBits': 0, 'laserPwm': None, 'toolNumber': -1}], 'startupError': None, 'status': 'processing', 'thisActive': None, 'thisInput': None, 'time': '2025-02-04T13:12:24', 'upTime': 58565}, 'tools': [{'active': [255.0], 'axes': [[0], [1], [2]], 'extruders': [0], 'fans': [0], 'feedForwardAdvance': 0, 'feedForwardPwm': [0.06], 'feedForwardTemp': [8.0], 'filamentExtruder': 0, 'heaters': [1], 'isRetracted': False, 'mix': [1.0], 'name': '', 'number': 0, 'offsets': [0, 0, 0], 'offsetsProbed': 0, 'retraction': {}, 'spindle': -1, 'spindleRpm': 0, 'standby': [155.0], 'state': 'active'}], 'volumes': [{'capacity': 31914983424, 'freeSpace': 30374756352, 'mounted': True, 'openFiles': True, 'partitionSize': 31902400512, 'path': '0:/', 'speed': 20000000}, {'capacity': None, 'freeSpace': None, 'mounted': False, 'openFiles': None, 'partitionSize': None, 'path': '1:/', 'speed': None}]}
+        )
+    ]
+)
+def test_merge(source, destination, expected):
+    """Test the merge function."""
+    result = merge_dictionary(source, destination)
+    assert result == expected
+
+@pytest.mark.asyncio
+async def test_handle_heater_faults_sets_error_and_creates_notification(virtual_client):
+    # Arrange
+    virtual_client.logger = Mock()
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+    virtual_client.event_loop = asyncio.get_event_loop()
+
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'heat': {
+            'heaters': [
+                {'state': 'fault'},
+                {'state': 'active'},
+            ]
+        }
+    }
+
+    # Act
+    await virtual_client._handle_heater_faults(old_om=None)
+
+    # Assert
+    assert virtual_client.printer.status == PrinterStatus.ERROR
+    virtual_client.logger.error.assert_called_with("Heater 0 is in fault state")
+    virtual_client.printer.notifications.keyed.assert_called_once()
+    call_args = virtual_client.printer.notifications.keyed.call_args
+    assert call_args[0][0] == ("heater_fault", 0)
+
+@pytest.mark.asyncio
+async def test_handle_heater_faults_no_notification_if_no_faults(virtual_client):
+    # Arrange
+    virtual_client.logger = Mock()
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'heat': {
+            'heaters': [
+                {'state': 'active'},
+                {'state': 'active'},
+            ]
+        }
+    }
+
+    # Act
+    await virtual_client._handle_heater_faults(old_om=None)
+
+    # Assert
+    assert virtual_client.printer.status == PrinterStatus.OPERATIONAL
+    virtual_client.printer.notifications.keyed.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_handle_heater_faults_retains_only_active_faults(virtual_client):
+    # Arrange
+    virtual_client.logger = Mock()
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+    virtual_client.event_loop = asyncio.get_event_loop()
+
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'heat': {
+            'heaters': [
+                {'state': 'fault'},
+                {'state': 'active'},
+                {'state': 'fault'},
+            ]
+        }
+    }
+
+    # Act
+    await virtual_client._handle_heater_faults(old_om=None)
+
+    # Assert
+    assert virtual_client.printer.notifications.keyed.call_count == 2
+    virtual_client.printer.notifications.filter_retain_keys.assert_called_once()
+    call_args = virtual_client.printer.notifications.filter_retain_keys.call_args
+    assert ("heater_fault", 0) in call_args[0][1:]
+    assert ("heater_fault", 2) in call_args[0][1:]
+
+
+@pytest.mark.asyncio
+async def test_handle_heater_faults_partial_om(virtual_client):
+    """Test that _handle_heater_faults handles partial OM with missing heater state."""
+    virtual_client.printer = Mock()
+    virtual_client.logger = Mock()
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'heat': {
+            'heaters': [
+                None,
+                {'current': 25.0},
+                {'state': 'active', 'current': 200.0},
+            ]
+        }
+    }
+
+    # Should not raise
+    await virtual_client._handle_heater_faults(old_om=None)
+
+    virtual_client.printer.notifications.filter_retain_keys.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_on_skip_objects_sends_m486_for_each_object(virtual_client):
+    """Test that on_skip_objects sends M486 P{id} for each object."""
+    virtual_client.logger = Mock()
+    virtual_client.duet = AsyncMock()
+
+    data = SkipObjectsDemandData(objects=[0, 2, 5])
+
+    await virtual_client.on_skip_objects(data)
+
+    assert virtual_client.duet.gcode.call_count == 3
+    virtual_client.duet.gcode.assert_any_call("M486 P0")
+    virtual_client.duet.gcode.assert_any_call("M486 P2")
+    virtual_client.duet.gcode.assert_any_call("M486 P5")
+
+
+@pytest.mark.asyncio
+async def test_on_skip_objects_empty_list(virtual_client):
+    """Test that on_skip_objects does nothing with an empty list."""
+    virtual_client.logger = Mock()
+    virtual_client.duet = AsyncMock()
+
+    data = SkipObjectsDemandData(objects=[])
+
+    await virtual_client.on_skip_objects(data)
+
+    virtual_client.duet.gcode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_skipped_objects_reports_cancelled(virtual_client):
+    """Test that _update_skipped_objects reports cancelled objects."""
+    virtual_client.printer = Mock()
+    virtual_client.send = AsyncMock()
+    job_status = {
+        'build': {
+            'currentObject': 1,
+            'objects': [
+                {'cancelled': True, 'name': 'object_0'},
+                {'cancelled': False, 'name': 'object_1'},
+                {'cancelled': True, 'name': 'object_2'},
+            ],
+        },
+    }
+
+    await virtual_client._update_skipped_objects(job_status)
+
+    assert virtual_client.printer.job_info.skipped_objects == [0, 2]
+    assert virtual_client.printer.job_info.object == 1
+
+
+@pytest.mark.asyncio
+async def test_update_skipped_objects_no_cancelled(virtual_client):
+    """Test that _update_skipped_objects reports empty list when none cancelled."""
+    virtual_client.printer = Mock()
+    virtual_client.send = AsyncMock()
+    job_status = {
+        'build': {
+            'currentObject': 0,
+            'objects': [
+                {'cancelled': False, 'name': 'object_0'},
+                {'cancelled': False, 'name': 'object_1'},
+            ],
+        },
+    }
+
+    await virtual_client._update_skipped_objects(job_status)
+
+    assert virtual_client.printer.job_info.skipped_objects == []
+    assert virtual_client.printer.job_info.object == 0
+
+
+@pytest.mark.asyncio
+async def test_update_skipped_objects_no_build_data(virtual_client):
+    """Test that _update_skipped_objects handles missing build data."""
+    virtual_client.printer = Mock()
+    virtual_client.send = AsyncMock()
+    job_status = {}
+
+    await virtual_client._update_skipped_objects(job_status)
+
+    assert virtual_client.printer.job_info.skipped_objects == []
+
+
+@pytest.mark.asyncio
+async def test_send_build_objects_only_on_change(virtual_client):
+    """Test that _send_build_objects only sends when objects change."""
+    virtual_client.send = AsyncMock()
+    build_objects = [
+        {'name': 'object_0', 'x': [0, 10], 'y': [0, 10]},
+        {'name': 'object_1', 'x': [20, 30], 'y': [20, 30]},
+    ]
+
+    await virtual_client._send_build_objects(build_objects)
+    assert virtual_client.send.call_count == 1
+
+    # Same objects again — should not send
+    await virtual_client._send_build_objects(build_objects)
+    assert virtual_client.send.call_count == 1
+
+    # Changed objects - should send
+    build_objects[0]['cancelled'] = True
+    await virtual_client._send_build_objects(build_objects)
+    assert virtual_client.send.call_count == 2
+
+
+# --- Group A: Pure/static methods ---
+
+
+@pytest.mark.parametrize(
+    'mode,choices,default,expected_keys',
+    [
+        (0, None, None, []),
+        (1, None, None, ['close']),
+        (2, None, None, ['ok']),
+        (3, None, None, ['ok', 'cancel']),
+        (4, ['Yes', 'No', 'Maybe'], None, ['choice_0', 'choice_1', 'choice_2']),
+        (5, None, 42, ['default', 'cancel']),
+        (6, None, 3.14, ['default', 'cancel']),
+        (7, None, 'hello', ['default', 'cancel']),
+    ],
+)
+def test_messagebox_actions(mode, choices, default, expected_keys):
+    """Test _messagebox_actions for all M291 modes."""
+    actions = DuetPrinter._messagebox_actions(mode, choices, default)
+    assert list(actions.keys()) == expected_keys
+
+
+def test_upload_file_progress(virtual_client):
+    """Test _upload_file_progress clamps between 50 and 90."""
+    virtual_client.printer = Mock()
+    virtual_client._upload_file_progress(0)
+    assert virtual_client.printer.file_progress.percent == 50.0
+
+    virtual_client._upload_file_progress(100)
+    assert virtual_client.printer.file_progress.percent == 90.0
+
+    virtual_client._upload_file_progress(50)
+    assert virtual_client.printer.file_progress.percent == 75.0
+
+    # Negative progress clamps to 50
+    virtual_client._upload_file_progress(-10)
+    assert virtual_client.printer.file_progress.percent == 50.0
+
+
+# --- Group B: Simple async handlers ---
+
+
+@pytest.mark.asyncio
+async def test_on_start_print(virtual_client):
+    """Test on_start_print sends M23 and M24."""
+    virtual_client.duet = AsyncMock()
+    virtual_client.printer = Mock()
+    virtual_client.printer.job_info.filename = 'test.gcode'
+
+    await virtual_client.on_start_print(None)
+
+    assert virtual_client.duet.gcode.call_count == 2
+    virtual_client.duet.gcode.assert_any_call('M23 "0:/gcodes/test.gcode"')
+    virtual_client.duet.gcode.assert_any_call('M24')
+
+
+@pytest.mark.asyncio
+async def test_on_pause(virtual_client):
+    """Test on_pause sends M25."""
+    virtual_client.duet = AsyncMock()
+    await virtual_client.on_pause(None)
+    virtual_client.duet.gcode.assert_awaited_once_with('M25')
+
+
+@pytest.mark.asyncio
+async def test_on_resume(virtual_client):
+    """Test on_resume sends M24."""
+    virtual_client.duet = AsyncMock()
+    await virtual_client.on_resume(None)
+    virtual_client.duet.gcode.assert_awaited_once_with('M24')
+
+
+@pytest.mark.asyncio
+async def test_on_cancel(virtual_client):
+    """Test on_cancel sends M25 then M0."""
+    virtual_client.duet = AsyncMock()
+    await virtual_client.on_cancel(None)
+    assert virtual_client.duet.gcode.call_count == 2
+    calls = [c[0][0] for c in virtual_client.duet.gcode.call_args_list]
+    assert calls == ['M25', 'M0']
+
+
+@pytest.mark.asyncio
+async def test_on_api_restart(virtual_client):
+    """Test on_api_restart raises KeyboardInterrupt."""
+    virtual_client.logger = Mock()
+    with pytest.raises(KeyboardInterrupt):
+        await virtual_client.on_api_restart()
+
+
+@pytest.mark.asyncio
+async def test_teardown(virtual_client):
+    """Test teardown is a no-op."""
+    await virtual_client.teardown()
+
+
+# --- Group C: String/validation methods ---
+
+
+def test_set_printer_name_matching(virtual_client):
+    """Test _set_printer_name extracts MBL model from matching name."""
+    virtual_client.printer = Mock()
+    network = {'name': 'meltingplot-MBL 100 ABC123'}
+    virtual_client._set_printer_name(network)
+    assert 'Meltingplot' in virtual_client.printer.firmware.machine_name
+    assert 'MBL' in virtual_client.printer.firmware.machine_name
+
+
+def test_set_printer_name_non_matching(virtual_client):
+    """Test _set_printer_name falls back to network name."""
+    virtual_client.printer = Mock()
+    network = {'name': 'My Custom Printer'}
+    virtual_client._set_printer_name(network)
+    assert virtual_client.printer.firmware.machine_name == 'My Custom Printer'
+
+
+def test_set_firmware_info(virtual_client):
+    """Test _set_firmware_info sets firmware name and version."""
+    virtual_client.printer = Mock()
+    board = {
+        'firmwareName': 'RepRapFirmware',
+        'firmwareVersion': '3.4.5',
+    }
+    virtual_client._set_firmware_info(board)
+    assert virtual_client.printer.firmware.name == 'RepRapFirmware'
+    assert virtual_client.printer.firmware.version == '3.4.5'
+
+
+def test_validate_duet_unique_id_match(virtual_client):
+    """Test _validate_duet_unique_id passes on match."""
+    virtual_client.config.duet_unique_id = 'abc123'
+    board = {'uniqueId': 'abc123'}
+    # Should not raise
+    virtual_client._validate_duet_unique_id(board)
+
+
+def test_validate_duet_unique_id_mismatch(virtual_client):
+    """Test _validate_duet_unique_id raises ValueError on mismatch."""
+    virtual_client.printer = Mock()
+    virtual_client.logger = Mock()
+    virtual_client.config.duet_unique_id = 'abc123'
+    board = {'uniqueId': 'xyz789'}
+    with pytest.raises(ValueError, match='Unique ID mismatch'):
+        virtual_client._validate_duet_unique_id(board)
+
+
+@pytest.mark.asyncio
+async def test_set_duet_unique_id(virtual_client):
+    """Test _set_duet_unique_id sets config and emits event."""
+    virtual_client.event_bus = AsyncMock()
+    board = {'uniqueId': 'new_id_123'}
+    await virtual_client._set_duet_unique_id(board)
+    assert virtual_client.config.duet_unique_id == 'new_id_123'
+    virtual_client.event_bus.emit.assert_awaited_once()
+
+
+# --- Group D: Job info updates ---
+
+
+@pytest.mark.asyncio
+async def test_update_job_progress_normal(virtual_client):
+    """Test _update_job_progress calculates filament-based progress."""
+    virtual_client.printer = Mock()
+    job_status = {
+        'file': {'filament': [100.0, 100.0]},
+        'rawExtrusion': 100.0,
+    }
+    await virtual_client._update_job_progress(job_status)
+    assert virtual_client.printer.job_info.progress == 50.0
+
+
+@pytest.mark.asyncio
+async def test_update_job_progress_zero_filament(virtual_client):
+    """Test _update_job_progress handles zero filament (ZeroDivisionError)."""
+    virtual_client.printer = Mock()
+    job_status = {
+        'file': {'filament': [0.0]},
+        'rawExtrusion': 0.0,
+    }
+    await virtual_client._update_job_progress(job_status)
+    assert virtual_client.printer.job_info.progress == 0.0
+
+
+@pytest.mark.asyncio
+async def test_update_job_progress_missing_key(virtual_client):
+    """Test _update_job_progress handles missing keys."""
+    virtual_client.printer = Mock()
+    await virtual_client._update_job_progress({})
+    assert virtual_client.printer.job_info.progress == 0.0
+
+
+@pytest.mark.asyncio
+async def test_update_job_times_left_normal(virtual_client):
+    """Test _update_job_times_left with valid timesLeft."""
+    virtual_client.printer = Mock()
+    job_status = {
+        'timesLeft': {'filament': 300, 'slicer': 200, 'file': 100},
+    }
+    await virtual_client._update_job_times_left(job_status)
+    # filament has priority
+    assert virtual_client.printer.job_info.time == 300
+
+
+@pytest.mark.asyncio
+async def test_update_job_times_left_fallback(virtual_client):
+    """Test _update_job_times_left falls back through priority chain."""
+    virtual_client.printer = Mock()
+    job_status = {
+        'timesLeft': {'filament': None, 'slicer': None, 'file': 100},
+    }
+    await virtual_client._update_job_times_left(job_status)
+    assert virtual_client.printer.job_info.time == 100
+
+
+@pytest.mark.asyncio
+async def test_update_job_times_left_missing(virtual_client):
+    """Test _update_job_times_left handles missing timesLeft."""
+    virtual_client.printer = Mock()
+    await virtual_client._update_job_times_left({})
+    assert virtual_client.printer.job_info.time == 0
+
+
+@pytest.mark.asyncio
+async def test_update_job_filename(virtual_client):
+    """Test _update_job_filename extracts filename from path."""
+    virtual_client.printer = Mock()
+    job_status = {
+        'file': {'fileName': '0:/gcodes/subfolder/test.gcode'},
+        'duration': 5,
+    }
+    await virtual_client._update_job_filename(job_status)
+    assert virtual_client.printer.job_info.filename == 'test.gcode'
+    assert virtual_client.printer.job_info.started is True
+
+
+@pytest.mark.asyncio
+async def test_update_job_filename_missing(virtual_client):
+    """Test _update_job_filename handles missing data gracefully."""
+    virtual_client.printer = Mock()
+    await virtual_client._update_job_filename({})
+    # Should not crash; no assertion on filename since it's a Mock
+
+
+@pytest.mark.asyncio
+async def test_update_job_layer(virtual_client):
+    """Test _update_job_layer extracts layer from job status."""
+    virtual_client.printer = Mock()
+    await virtual_client._update_job_layer({'layer': 42})
+    assert virtual_client.printer.job_info.layer == 42
+
+
+@pytest.mark.asyncio
+async def test_update_job_layer_missing(virtual_client):
+    """Test _update_job_layer defaults to 0."""
+    virtual_client.printer = Mock()
+    await virtual_client._update_job_layer({})
+    assert virtual_client.printer.job_info.layer == 0
+
+
+@pytest.mark.asyncio
+async def test_update_times_left_priority(virtual_client):
+    """Test _update_times_left follows filament > slicer > file > 0."""
+    virtual_client.printer = Mock()
+    await virtual_client._update_times_left({'filament': 100, 'slicer': 200, 'file': 300})
+    assert virtual_client.printer.job_info.time == 100
+
+    await virtual_client._update_times_left({'filament': None, 'slicer': 200, 'file': 300})
+    assert virtual_client.printer.job_info.time == 200
+
+    await virtual_client._update_times_left({'filament': None, 'slicer': None, 'file': 300})
+    assert virtual_client.printer.job_info.time == 300
+
+    await virtual_client._update_times_left({'filament': None, 'slicer': None, 'file': None})
+    assert virtual_client.printer.job_info.time == 0
+
+
+@pytest.mark.asyncio
+async def test_is_printing_by_status(virtual_client):
+    """Test _is_printing returns True for printing-related statuses."""
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {'job': {'file': {}}}
+
+    for status in [PrinterStatus.PRINTING, PrinterStatus.PAUSED, PrinterStatus.PAUSING, PrinterStatus.RESUMING]:
+        virtual_client.printer = Mock()
+        virtual_client.printer.status = status
+        assert await virtual_client._is_printing() is True
+
+
+@pytest.mark.asyncio
+async def test_is_printing_by_filename(virtual_client):
+    """Test _is_printing returns True when job has a filename."""
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {'job': {'file': {'filename': 'test.gcode'}}}
+
+    assert await virtual_client._is_printing() is True
+
+
+@pytest.mark.asyncio
+async def test_is_printing_false(virtual_client):
+    """Test _is_printing returns False when idle and no filename."""
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {'job': {'file': {}}}
+
+    assert await virtual_client._is_printing() is False
+
+
+@pytest.mark.asyncio
+async def test_update_printer_status_cancelling(virtual_client):
+    """Test _update_printer_status detects cancel transition."""
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.PRINTING
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {'state': {'status': 'cancelling'}, 'job': {'file': {}}}
+
+    await virtual_client._update_printer_status()
+
+    assert virtual_client.printer.status == PrinterStatus.CANCELLING
+    assert virtual_client.printer.job_info.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_update_printer_status_finished(virtual_client):
+    """Test _update_printer_status detects finish transition."""
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.PRINTING
+    virtual_client.printer.job_info.started = True
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {'state': {'status': 'idle'}, 'job': {'file': {}}}
+
+    await virtual_client._update_printer_status()
+
+    assert virtual_client.printer.job_info.finished is True
+    assert virtual_client.printer.job_info.progress == 100.0
+
+
+@pytest.mark.asyncio
+async def test_mark_job_as_finished(virtual_client):
+    """Test _mark_job_as_finished sets finished, progress, and clears build objects."""
+    virtual_client.printer = Mock()
+    virtual_client._last_build_objects = [{'name': 'obj1'}]
+
+    await virtual_client._mark_job_as_finished()
+
+    assert virtual_client.printer.job_info.finished is True
+    assert virtual_client.printer.job_info.progress == 100.0
+    assert virtual_client._last_build_objects is None
+
+
+# --- Group E: Sensor/temperature/network updates ---
+
+
+@pytest.mark.asyncio
+async def test_update_temperatures(virtual_client):
+    """Test _update_temperatures sets bed and tool temperatures."""
+    virtual_client.printer = Mock()
+    virtual_client.printer.tools = [Mock()]
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'heat': {
+            'bedHeaters': [0],
+            'heaters': [
+                {'current': 60.0, 'active': 65.0, 'state': 'active'},
+                {'current': 200.0, 'active': 210.0, 'state': 'active'},
+            ],
+        },
+        'tools': [
+            {'heaters': [1]},
+        ],
+    }
+
+    await virtual_client._update_temperatures()
+
+    assert virtual_client.printer.bed.temperature.actual == 60.0
+    assert virtual_client.printer.bed.temperature.target == 65.0
+    assert virtual_client.printer.tools[0].temperature.actual == 200.0
+    assert virtual_client.printer.tools[0].temperature.target == 210.0
+    assert virtual_client.printer.ambient_temperature.ambient == 20
+
+
+@pytest.mark.asyncio
+async def test_update_temperatures_off_state(virtual_client):
+    """Test _update_temperatures shows 0.0 target when heater is off."""
+    virtual_client.printer = Mock()
+    virtual_client.printer.tools = [Mock()]
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'heat': {
+            'bedHeaters': [0],
+            'heaters': [
+                {'current': 25.0, 'active': 65.0, 'state': 'off'},
+                {'current': 25.0, 'active': 210.0, 'state': 'off'},
+            ],
+        },
+        'tools': [
+            {'heaters': [1]},
+        ],
+    }
+
+    await virtual_client._update_temperatures()
+
+    assert virtual_client.printer.bed.temperature.target == 0.0
+    assert virtual_client.printer.tools[0].temperature.target == 0.0
+
+
+@pytest.mark.asyncio
+async def test_update_filament_sensor_loaded(virtual_client):
+    """Test _update_filament_sensor sets LOADED when status is ok."""
+    virtual_client.printer = Mock()
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'sensors': {
+            'filamentMonitors': [
+                {'enableMode': 1, 'status': 'ok'},
+            ],
+        },
+    }
+
+    await virtual_client._update_filament_sensor()
+
+    from simplyprint_ws_client.core.state import FilamentSensorEnum
+    assert virtual_client.printer.filament_sensor.state == FilamentSensorEnum.LOADED
+
+
+@pytest.mark.asyncio
+async def test_update_filament_sensor_runout(virtual_client):
+    """Test _update_filament_sensor sets RUNOUT when status is not ok."""
+    virtual_client.printer = Mock()
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'sensors': {
+            'filamentMonitors': [
+                {'enableMode': 1, 'status': 'noFilament'},
+            ],
+        },
+    }
+
+    await virtual_client._update_filament_sensor()
+
+    from simplyprint_ws_client.core.state import FilamentSensorEnum
+    assert virtual_client.printer.filament_sensor.state == FilamentSensorEnum.RUNOUT
+
+
+@pytest.mark.asyncio
+async def test_update_filament_sensor_calibrated_runout(virtual_client):
+    """Test _update_filament_sensor detects runout via calibration thresholds."""
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.PAUSED
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'sensors': {
+            'filamentMonitors': [
+                {
+                    'enableMode': 1,
+                    'status': 'ok',
+                    'calibrated': {'percentMin': 50, 'percentMax': 150},
+                    'configured': {'percentMin': 80, 'percentMax': 120},
+                },
+            ],
+        },
+    }
+
+    await virtual_client._update_filament_sensor()
+
+    from simplyprint_ws_client.core.state import FilamentSensorEnum
+    assert virtual_client.printer.filament_sensor.state == FilamentSensorEnum.RUNOUT
+
+
+@pytest.mark.asyncio
+async def test_update_filament_sensor_partial_om(virtual_client):
+    """Test _update_filament_sensor skips None monitors in partial OM."""
+    virtual_client.printer = Mock()
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'sensors': {
+            'filamentMonitors': [
+                None,
+                {'status': 'ok'},
+                {'enableMode': 1, 'status': 'ok'},
+            ],
+        },
+    }
+
+    await virtual_client._update_filament_sensor()
+
+    from simplyprint_ws_client.core.state import FilamentSensorEnum
+    assert virtual_client.printer.filament_sensor.state == FilamentSensorEnum.LOADED
+
+
+@pytest.mark.asyncio
+async def test_update_skipped_objects_partial_om(virtual_client):
+    """Test _update_skipped_objects handles None objects in partial OM."""
+    virtual_client.printer = Mock()
+    virtual_client.send = AsyncMock()
+    job_status = {
+        'build': {
+            'currentObject': 0,
+            'objects': [
+                {'cancelled': True, 'name': 'object_0'},
+                None,
+                {'cancelled': False, 'name': 'object_2'},
+            ],
+        },
+    }
+
+    await virtual_client._update_skipped_objects(job_status)
+
+    assert virtual_client.printer.job_info.skipped_objects == [0]
+
+
+@pytest.mark.asyncio
+async def test_send_build_objects_partial_om(virtual_client):
+    """Test _send_build_objects skips None entries in partial OM."""
+    virtual_client.send = AsyncMock()
+    build_objects = [
+        {'name': 'object_0', 'x': [0, 10], 'y': [0, 10]},
+        None,
+        {'name': 'object_2'},
+    ]
+
+    await virtual_client._send_build_objects(build_objects)
+
+    assert virtual_client.send.call_count == 1
+
+
+def test_update_network_info(virtual_client):
+    """Test _update_network_info sets local_ip and mac."""
+    virtual_client.printer = Mock()
+
+    with patch(
+        'simplyprint_duet3d.printer.get_local_ip_and_mac',
+    ) as mock_net:
+        from simplyprint_duet3d.network import NetworkInfo
+        mock_net.return_value = NetworkInfo(ip='192.168.1.10', mac='aa:bb:cc:dd:ee:ff')
+        virtual_client._update_network_info()
+
+    assert virtual_client.printer.info.local_ip == '192.168.1.10'
+    assert virtual_client.printer.info.mac == 'aa:bb:cc:dd:ee:ff'
+
+
+# --- Group H: Printer offline detection ---
+
+
+@pytest.mark.asyncio
+async def test_ensure_duet_connection_catches_bare_timeout_error(virtual_client):
+    """Test _ensure_duet_connection catches bare TimeoutError from reauthenticate."""
+    virtual_client.duet = Mock()
+    virtual_client.duet.connected.return_value = False
+    virtual_client.duet.connect = AsyncMock(
+        side_effect=TimeoutError('Retried 3 times to reauthenticate.'),
+    )
+    virtual_client.duet.close = AsyncMock()
+
+    with pytest.raises(TimeoutError):
+        await virtual_client._ensure_duet_connection()
+
+    virtual_client.duet.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_duet_connection_catches_client_connection_error(virtual_client):
+    """Test _ensure_duet_connection catches aiohttp.ClientConnectionError."""
+    virtual_client.duet = Mock()
+    virtual_client.duet.connected.return_value = False
+    virtual_client.duet.connect = AsyncMock(
+        side_effect=aiohttp.ClientConnectionError('Connection refused'),
+    )
+    virtual_client.duet.close = AsyncMock()
+
+    with pytest.raises(TimeoutError):
+        await virtual_client._ensure_duet_connection()
+
+    virtual_client.duet.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_duet_printer_task_keeps_status_on_transient_timeout(virtual_client):
+    """Test _duet_printer_task does not set OFFLINE on a transient TimeoutError.
+
+    A single timeout should not mark the printer offline. The printer
+    should only go offline after the 5-minute _printer_timeout expires.
+    """
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+    virtual_client._is_stopped = False
+    virtual_client._printer_timeout = time.time() + 300
+    virtual_client._background_task = set()
+    virtual_client.event_loop = asyncio.get_event_loop()
+
+    async def ensure_connection_fails():
+        virtual_client._is_stopped = True
+        raise TimeoutError('Retried 3 times to reauthenticate.')
+
+    virtual_client._ensure_duet_connection = ensure_connection_fails
+
+    task = await virtual_client._duet_printer_task()
+    await task
+
+    assert virtual_client.printer.status == PrinterStatus.OPERATIONAL
+
+
+@pytest.mark.asyncio
+async def test_duet_printer_task_timeout_sets_offline(virtual_client):
+    """Test _duet_printer_task sets OFFLINE when printer timeout expires."""
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+    virtual_client._is_stopped = False
+    # Set timeout in the past so it triggers immediately
+    virtual_client._printer_timeout = time.time() - 1
+    virtual_client._background_task = set()
+    virtual_client.event_loop = asyncio.get_event_loop()
+    virtual_client.duet = Mock()
+    virtual_client.duet.close = AsyncMock()
+
+    async def ensure_connection_fails():
+        virtual_client._is_stopped = True
+        raise TimeoutError('connection failed')
+
+    virtual_client._ensure_duet_connection = ensure_connection_fails
+
+    task = await virtual_client._duet_printer_task()
+    await task
+
+    assert virtual_client.printer.status == PrinterStatus.OFFLINE
+    virtual_client.duet.close.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_duet_printer_task_tick_without_data_does_not_reset_timeout(virtual_client):
+    """Test that tick() returning without emitting data does not reset the timeout.
+
+    The _printer_timeout should only be reset when the printer actually
+    sends data (via objectmodel or connect events), not when tick()
+    simply returns without error.
+    """
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+    virtual_client._is_stopped = False
+    original_timeout = time.time() + 10  # 10 seconds from now
+    virtual_client._printer_timeout = original_timeout
+    virtual_client._background_task = set()
+    virtual_client.event_loop = asyncio.get_event_loop()
+
+    tick_count = 0
+
+    async def noop_ensure_connection():
+        pass
+
+    async def noop_tick():
+        nonlocal tick_count
+        tick_count += 1
+        if tick_count >= 2:
+            virtual_client._is_stopped = True
+
+    virtual_client._ensure_duet_connection = noop_ensure_connection
+    virtual_client.duet = Mock()
+    virtual_client.duet.close = AsyncMock()
+    virtual_client.duet.tick = noop_tick
+
+    task = await virtual_client._duet_printer_task()
+    await task
+
+    # Timeout must not have been extended beyond the original value
+    assert virtual_client._printer_timeout == original_timeout
+
+
+@pytest.mark.asyncio
+async def test_objectmodel_event_resets_printer_timeout(virtual_client):
+    """Test that receiving objectmodel data resets the _printer_timeout."""
+    virtual_client._printer_timeout = time.time() - 1  # expired
+    virtual_client.printer = Mock()
+    virtual_client.printer.status = PrinterStatus.OPERATIONAL
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {'state': {'status': 'idle'}, 'job': {'file': {}}}
+    virtual_client.duet.events = Mock()
+
+    with patch.object(virtual_client, '_update_printer_status', new_callable=AsyncMock):
+        with patch.object(virtual_client, '_update_filament_sensor', new_callable=AsyncMock):
+            with patch.object(virtual_client, '_mesh_compensation_status', new_callable=AsyncMock):
+                with patch.object(virtual_client, '_update_temperatures', new_callable=AsyncMock):
+                    with patch.object(virtual_client, '_is_printing', new_callable=AsyncMock, return_value=False):
+                        with patch.object(virtual_client, '_handle_heater_faults', new_callable=AsyncMock):
+                            with patch.object(virtual_client, '_handle_messagebox', new_callable=AsyncMock):
+                                await virtual_client._duet_on_objectmodel(old_om=None)
+
+    assert virtual_client._printer_timeout > time.time()
+
+
+@pytest.mark.asyncio
+async def test_connect_event_resets_printer_timeout(virtual_client):
+    """Test that a successful connect resets the _printer_timeout."""
+    virtual_client._printer_timeout = time.time() - 1  # expired
+    virtual_client.duet = Mock()
+    virtual_client.duet.om = {
+        'boards': [{'uniqueId': 'unique_id', 'firmwareName': 'RRF', 'firmwareVersion': '3.5'}],
+        'network': {'name': 'test-printer'},
+    }
+    virtual_client.duet.upload_stream = AsyncMock()
+
+    await virtual_client._duet_on_connect()
+
+    assert virtual_client._printer_timeout > time.time()

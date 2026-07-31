@@ -1,1 +1,3 @@
+*.py text eol=lf
+
 meltingplot/duet_simplyprint_connector/_version.py export-subst

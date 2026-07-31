@@ -18,18 +18,18 @@ Supported features:
 
 - Printer registration
 - Printer status update
-- Webcam snapshot livestream
+- Webcam snapshots and MJPEG livestreaming via the ``simplyprint-ws-client`` camera pool
 - GCode receiving
 - File downloading
 - Printer control (start, pause, resume, cancel)
-- Self Upgrading VIA G-Code M997
-- Device healts update
+- Self upgrading via G-Code M997
+- Device health update
 - Bed leveling
-- Filament Sensor
+- Filament sensor
 - Duet auto discovery with tracking based on BoardID
-- Leave a cookie on the printer to identify the printer in the future (`0:/sys/simplyprint-connector.json`)
-- Grab the webcam url from DWC Settings file from the Printer
-- Allow Webcam URL to be an Snapshot Endpoint or MJPEG Stream
+- Leave a cookie on the printer to identify the printer in the future (``0:/sys/simplyprint-connector.json``)
+- Grab the webcam URL from DWC settings file from the printer
+- Webcam URL can be a snapshot endpoint or MJPEG stream
 
 Missing features:
 

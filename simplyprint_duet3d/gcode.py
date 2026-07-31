@@ -10,6 +10,12 @@ except ImportError:
 
 import attr
 
+# Column at which inline comments are aligned
+COMMENT_ALIGNMENT_COLUMN = 60
+
+# Indentation threshold for continuation comments
+CONTINUATION_INDENT_THRESHOLD = 4
+
 
 @attr.s
 class GCodeCommand:
