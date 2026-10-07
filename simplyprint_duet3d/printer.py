@@ -48,6 +48,7 @@ from .duet.model import (
     DEFAULT_OM_FREQUENT_PATHS,
     DEFAULT_OM_INCLUDE_PATHS,
     DuetPrinterModel,
+    DuetState,
 )
 from .duet.om_filter import ObjectModelFilter
 from .gcode import GCodeBlock
@@ -109,6 +110,8 @@ class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinte
 
     # File handling
     AUTO_START_TIMEOUT = 400  # seconds
+    CANCEL_PAUSE_TIMEOUT = 120  # seconds
+    CANCEL_PAUSE_POLL_INTERVAL = 0.5  # seconds
     FILE_INFO_TIMEOUT = 10  # seconds
     FILE_PROGRESS_UPDATE_INTERVAL = 5  # seconds
     UPLOAD_MAX_RETRIES = 3
@@ -610,7 +613,20 @@ class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinte
 
     async def on_cancel(self, _) -> None:
         """Cancel the print job."""
+        await self._cancel_print()
+
+    @async_task
+    async def _cancel_print(self) -> None:
+        """Pause, wait until paused, then cancel.
+
+        RRF only cancels a print with M0 once it is paused. Over the DCS socket
+        codes are submitted asynchronously, so M0 sent right after M25 runs
+        while the job is still pausing and is ignored; wait for the pause.
+        """
         await self.duet.gcode('M25')
+        deadline = time.monotonic() + self.CANCEL_PAUSE_TIMEOUT
+        while self.duet.state in (DuetState.processing, DuetState.pausing) and time.monotonic() < deadline:
+            await asyncio.sleep(self.CANCEL_PAUSE_POLL_INTERVAL)
         await self.duet.gcode('M0')
 
     async def on_skip_objects(self, data: SkipObjectsDemandData) -> None:
@@ -656,7 +672,8 @@ class DuetPrinter(DefaultClient[DuetPrinterConfig], ClientCameraMixin[DuetPrinte
 
             x_bounds = obj.get('x')
             y_bounds = obj.get('y')
-            if x_bounds and y_bounds:
+            # RRF reports [null, null] until the object's bounds are known.
+            if x_bounds and y_bounds and None not in x_bounds and None not in y_bounds:
                 entry.bbox = [x_bounds[0], y_bounds[0], x_bounds[1], y_bounds[1]]
                 entry.center = [
                     (x_bounds[0] + x_bounds[1]) / 2.0,
