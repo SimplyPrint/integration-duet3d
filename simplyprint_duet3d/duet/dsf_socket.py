@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import AsyncIterable, AsyncIterator, BinaryIO, Callable, Optional
 
@@ -424,18 +425,36 @@ class DuetControlSocket(DuetAPIBase):
             filesize = file.tell()
             file.seek(0)
 
-            with open(real_path, 'wb') as out:
-                written = 0
-                while True:
-                    chunk = file.read(FILE_IO_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    written += len(chunk)
-                    if progress and filesize > 0:
-                        progress(
-                            max(0.0, min(PROGRESS_MAX, written / filesize * PROGRESS_MAX)),
-                        )
+            # DSF owns the SD directory and the files it wrote (dsf:dsf 0644);
+            # the connector runs as another user in the dsf group. Overwriting
+            # such a file in place fails, so write a temp file and rename it
+            # over the target, which only needs write access to the directory.
+            fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix='.', suffix='.part')
+            try:
+                with os.fdopen(fd, 'wb') as out:
+                    written = 0
+                    while True:
+                        chunk = file.read(FILE_IO_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        written += len(chunk)
+                        if progress and filesize > 0:
+                            progress(
+                                max(0.0, min(PROGRESS_MAX, written / filesize * PROGRESS_MAX)),
+                            )
+                # Keep the file replaceable by DSF: group of the directory, group-writable.
+                dir_gid = os.stat(parent_dir).st_gid
+                if os.stat(tmp_path).st_gid != dir_gid:
+                    os.chown(tmp_path, -1, dir_gid)
+                os.chmod(tmp_path, 0o664)
+                os.replace(tmp_path, real_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+                raise
 
         try:
             await loop.run_in_executor(None, _write_file)
