@@ -1,6 +1,7 @@
 """Tests for the VirtualClient class."""
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
@@ -4218,3 +4219,38 @@ async def test_update_heater_fault_notifications_removes_cleared_fault_notificat
     assert len(resolved_notifications) == 1
     assert active_notifications[0].payload.data["heater"] == 0
     assert resolved_notifications[0].payload.data["heater"] == 1
+
+
+@pytest.mark.asyncio
+async def test_on_connected_reconnect_does_not_start_second_duet_poller(virtual_client):
+    """A SimplyPrint websocket reconnect must not add another Duet polling loop."""
+    virtual_client._background_task = set()
+    virtual_client.event_loop = asyncio.get_running_loop()
+    virtual_client.use_running_loop = Mock()
+    virtual_client._printer_timeout = time.time() + 300
+
+    async def tick():
+        await asyncio.sleep(0)
+
+    virtual_client._ensure_duet_connection = AsyncMock()
+    virtual_client.duet = Mock()
+    virtual_client.duet.tick = tick
+    virtual_client.duet.close = AsyncMock()
+    virtual_client._update_cpu_and_memory_info = AsyncMock()
+    virtual_client._update_network_info = Mock()
+    connected = Mock()
+
+    for _ in range(5):
+        await virtual_client.on_connected(connected)
+
+    assert len(virtual_client._background_task) == 2
+
+    stopped = list(virtual_client._background_task)
+    await virtual_client.on_remove_connection(None)
+    await asyncio.gather(*stopped, return_exceptions=True)
+    await virtual_client.on_connected(connected)
+
+    assert len(virtual_client._background_task) == 2
+
+    await virtual_client.on_remove_connection(None)
+    await asyncio.gather(*virtual_client._background_task, return_exceptions=True)

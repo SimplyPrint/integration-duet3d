@@ -96,6 +96,8 @@ class DuetPrinter(
     duet: DuetPrinterModel
     watchdog: Watchdog
     _poll_interval: float = DEFAULT_POLL_INTERVAL
+    _duet_task: Optional[asyncio.Task] = None
+    _status_task: Optional[asyncio.Task] = None
 
     def __init__(self, *args, **kwargs) -> None:
         """Initialize the client."""
@@ -315,8 +317,13 @@ class DuetPrinter(
         self.use_running_loop()
         self._is_stopped = False
 
-        await self._duet_printer_task()
-        await self._connector_status_task()
+        # on_connected fires on every SimplyPrint websocket reconnect, while
+        # on_remove_connection only fires when the printer is removed. Start
+        # each loop once, otherwise every reconnect adds another Duet poller.
+        if self._duet_task is None or self._duet_task.done():
+            self._duet_task = await self._duet_printer_task()
+        if self._status_task is None or self._status_task.done():
+            self._status_task = await self._connector_status_task()
 
     async def on_remove_connection(self, _) -> None:
         """Remove the connection."""
@@ -324,6 +331,8 @@ class DuetPrinter(
         self._is_stopped = True
         for task in self._background_task:
             task.cancel()
+        self._duet_task = None
+        self._status_task = None
 
     async def on_printer_settings(
         self,
